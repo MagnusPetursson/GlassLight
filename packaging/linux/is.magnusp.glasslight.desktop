@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=GlassLight
+GenericName=Generative Caustics Studio
+Comment=Shape light through invisible procedural glass
+Exec=glasslight
+Icon=is.magnusp.glasslight
+Terminal=false
+Categories=Graphics;2DGraphics;
+StartupNotify=true
+Keywords=generative;art;light;glass;caustics;refraction;

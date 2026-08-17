@@ -1,0 +1,320 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) buffer Accumulation {
+    uint values[];
+} accumulation;
+
+layout(set = 0, binding = 2, std430) buffer Statistics {
+    uint deposited;
+    uint internalReflections;
+    uint objectHits;
+    uint wallMisses;
+    uint interfaceEvents;
+    uint traversalExhausted;
+    uint previewHits;
+    uint reserved;
+} statistics;
+
+shared uint groupDeposited;
+shared uint groupReflections;
+shared uint groupObjectHits;
+shared uint groupWallMisses;
+shared uint groupInterfaces;
+shared uint groupExhausted;
+
+struct FractureShardGpu {
+    vec4 baseLength;
+    vec4 axisRadius;
+    vec4 basisTip;
+    vec4 separationProfile;
+    uvec4 paletteSidesPlanes;
+};
+
+struct FracturePlaneSetGpu {
+    vec4 values[13];
+};
+
+layout(set = 0, binding = 3, std430) readonly buffer Settings {
+    vec4 palette[5];
+    uvec4 shapeRegion;
+    vec4 geometry;
+    vec4 optical;
+    vec4 light;
+    vec4 rotation;
+    uvec4 renderOptions; // quality, reserved...
+#ifdef GLASSLIGHT_FRACTURE_SHADER
+    uvec4 fractureInfo; // count, resolved morphology, resolved motion, reserved
+    vec4 fractureBounds; // local center.xyz, conservative radius
+    FractureShardGpu fractureShards[16];
+    FracturePlaneSetGpu fracturePlanes[16];
+#endif
+} settings;
+
+#include "geometry.glsl"
+
+layout(push_constant) uniform TracePush {
+    uint width;
+    uint height;
+    uint dispatchSamples;
+    uint sampleBaseLow;
+    uint sampleBaseHigh;
+    uint totalSamples;
+    uint progressivePass;
+    uint exportRender;
+} pc;
+
+vec2 concentricDisk(float u1, float u2) {
+    vec2 u = 2.0 * vec2(u1, u2) - 1.0;
+    if (u.x == 0.0 && u.y == 0.0) return vec2(0.0);
+    float radius;
+    float angle;
+    if (abs(u.x) > abs(u.y)) {
+        radius = u.x;
+        angle = 0.25 * GL_PI * (u.y / u.x);
+    } else {
+        radius = u.y;
+        angle = 0.5 * GL_PI - 0.25 * GL_PI * (u.x / u.y);
+    }
+    return radius * vec2(cos(angle), sin(angle));
+}
+
+vec3 roughenNormal(vec3 normal, uint sequence, float roughness) {
+    vec3 randomVector = normalize(vec3(glassRandom01(sequence) - 0.5,
+        glassRandom01(sequence ^ 0x9e3779b9u) - 0.5,
+        glassRandom01(sequence ^ 0x243f6a88u) - 0.5));
+    return normalize(normal + randomVector * max(roughness, 0.0) * 0.42);
+}
+
+// Conservative unsigned marching is intentionally used here. The glass field
+// may contain thin shells, cavities and disconnected pieces; abs(SDF) plus a
+// sub-unit safety factor finds the next sign boundary from either medium.
+#ifdef GLASSLIGHT_FRACTURE_SHADER
+bool marchNextInterface(vec3 origin, vec3 direction, float maximumDistance,
+                        out vec3 hit, out float traveled, out vec3 hitNormal) {
+    return glassFractureNextInterface(origin, direction, maximumDistance,
+                                      hit, traveled, hitNormal);
+}
+#else
+bool marchNextInterface(vec3 origin, vec3 direction, float maximumDistance,
+                        out vec3 hit, out float traveled) {
+    traveled = 0.0;
+    for (int step = 0; step < 80; ++step) {
+        hit = origin + direction * traveled;
+        float d = abs(glassSdf(hit));
+        if (d < 0.0012 && traveled > 0.0005) return true;
+        traveled += max(d * 0.82, 0.0017);
+        if (traveled >= maximumDistance) return false;
+    }
+    return false;
+}
+#endif
+
+bool intersectObjectBounds(vec3 origin, vec3 direction, out float nearT, out float farT) {
+#ifdef GLASSLIGHT_FRACTURE_SHADER
+    vec3 center = glassObjectBoundsCenter();
+    float radius = glassObjectBoundsRadius();
+    vec3 relativeOrigin = origin - center;
+    float b = dot(relativeOrigin, direction);
+    float c = dot(relativeOrigin, relativeOrigin) - radius * radius;
+#else
+    float radius = 1.08 * max(settings.geometry.x, 0.05);
+    float b = dot(origin, direction);
+    float c = dot(origin, origin) - radius * radius;
+#endif
+    float discriminant = b * b - c;
+    if (discriminant <= 0.0) return false;
+    float root = sqrt(discriminant);
+    nearT = -b - root;
+    farT = -b + root;
+    return farT > max(nearT, 0.0);
+}
+
+bool splat(vec2 wall, uint channel, float energy, uint sequence) {
+    float aspect = float(pc.width) / max(float(pc.height), 1.0);
+    vec2 uv = wall / vec2(3.25 * aspect, 3.25) + 0.5;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThanEqual(uv, vec2(1.0)))) return false;
+    vec2 pixel = uv * vec2(pc.width, pc.height) - 0.5;
+    ivec2 base = ivec2(floor(pixel));
+    vec2 fraction = fract(pixel);
+    uint fixedEnergy = uint(clamp(energy * 128.0, 0.0, 4095.0));
+    // Deterministic stochastic bilinear filtering is unbiased across the
+    // photon sequence and replaces four contended global atomics with one.
+    int ox = glassRandom01(sequence ^ 0xb5297a4du) < fraction.x ? 1 : 0;
+    int oy = glassRandom01(sequence ^ 0x68e31da4u) < fraction.y ? 1 : 0;
+    ivec2 position = base + ivec2(ox, oy);
+    if (position.x < 0 || position.y < 0 ||
+        position.x >= int(pc.width) || position.y >= int(pc.height)) return false;
+    uint index = (uint(position.y) * pc.width + uint(position.x)) * 3u + channel;
+    atomicAdd(accumulation.values[index], fixedEnergy);
+    return true;
+}
+
+void tracePhoton(uint localSample) {
+    uint sampleIndex = pc.sampleBaseLow + localSample;
+    uint sequence = glassHash32(sampleIndex ^ settings.shapeRegion.w ^
+                                glassHash32(pc.sampleBaseHigh));
+    vec2 targetDisk = concentricDisk(glassRandom01(sequence),
+                                     glassRandom01(sequence ^ 0x9e3779b9u));
+    vec2 emitterDisk = concentricDisk(glassRandom01(sequence ^ 0x68bc21ebu),
+                                      glassRandom01(sequence ^ 0x02e5be93u));
+    vec3 source = vec3(settings.light.xy + emitterDisk * settings.optical.w,
+                       -max(settings.optical.z, 1.25));
+    vec3 boundsCenter = glassObjectBoundsCenter();
+#ifdef GLASSLIGHT_FRACTURE_SHADER
+    float targetRadius = 0.78 * glassObjectBoundsRadius();
+#else
+    float targetRadius = 0.86 * max(settings.geometry.x, 0.1);
+#endif
+    vec3 target = boundsCenter + vec3(targetDisk * targetRadius, 0.0);
+    vec3 initialDirection = normalize(target - source);
+
+    float boundsNear;
+    float boundsFar;
+    if (!intersectObjectBounds(source, initialDirection, boundsNear, boundsFar)) return;
+    float startT = max(boundsNear - 0.006, 0.0);
+    vec3 boundStart = source + initialDirection * startT;
+    vec3 firstInterface;
+    float firstTravel;
+#ifdef GLASSLIGHT_FRACTURE_SHADER
+    vec3 firstNormal;
+    if (!marchNextInterface(boundStart, initialDirection,
+                            boundsFar - startT + 0.008,
+                            firstInterface, firstTravel, firstNormal)) return;
+#else
+    if (!marchNextInterface(boundStart, initialDirection,
+                            boundsFar - startT + 0.008,
+                            firstInterface, firstTravel)) return;
+#endif
+
+    atomicAdd(groupObjectHits, 1u);
+    uint quality = min(settings.renderOptions.x, 2u);
+#ifdef GLASSLIGHT_FRACTURE_SHADER
+    int maximumInterfaces = quality == 0u ? 8 : (quality == 1u ? 12 : 16);
+#else
+    int maximumInterfaces = quality == 0u ? 6 : (quality == 1u ? 8 : 12);
+#endif
+    float ior = max(settings.optical.x, 1.01);
+    float fresnelLoss = 1.0 - pow((ior - 1.0) / (ior + 1.0), 2.0);
+    vec3 position = firstInterface;
+    vec3 direction = initialDirection;
+    vec3 transmission = vec3(1.0);
+    vec2 spectralBend = vec2(0.0);
+    bool insideGlass = false;
+    bool terminated = false;
+    bool depositedAny = false;
+    uint interfaceCount = 0u;
+    uint reflectionCount = 0u;
+
+#ifdef GLASSLIGHT_FRACTURE_SHADER
+    for (int interfaceIndex = 0; interfaceIndex < 16; ++interfaceIndex) {
+#else
+    for (int interfaceIndex = 0; interfaceIndex < 12; ++interfaceIndex) {
+#endif
+        if (interfaceIndex >= maximumInterfaces) break;
+        vec3 interfacePoint = firstInterface;
+#ifdef GLASSLIGHT_FRACTURE_SHADER
+        vec3 interfaceNormal = firstNormal;
+#endif
+        float segmentLength = 0.0;
+        bool foundInterface = interfaceIndex == 0;
+
+        if (interfaceIndex > 0) {
+            float wallT = direction.z > 0.0001 ? (2.25 - position.z) / direction.z : -1.0;
+            float nextNear;
+            float nextFar;
+            bool crossesBounds = intersectObjectBounds(position, direction, nextNear, nextFar);
+            float objectLimit = crossesBounds ? nextFar + 0.006 : 0.0;
+            float limit = wallT > 0.0 ? min(wallT, objectLimit) : objectLimit;
+#ifdef GLASSLIGHT_FRACTURE_SHADER
+            foundInterface = limit > 0.0 && marchNextInterface(
+                position, direction, limit, interfacePoint, segmentLength, interfaceNormal);
+#else
+            foundInterface = limit > 0.0 && marchNextInterface(
+                position, direction, limit, interfacePoint, segmentLength);
+#endif
+
+            if (insideGlass && segmentLength > 0.0) {
+                vec3 midpoint = position + direction * (segmentLength * 0.5);
+                vec3 tint = glassRegionTint(glassWorldToLocal(midpoint));
+                vec3 absorption = (vec3(1.0) - tint) *
+                                  (0.35 + 2.2 * settings.geometry.z);
+                transmission *= exp(-segmentLength * absorption);
+            }
+
+            if (!foundInterface) {
+                if (wallT > 0.0 && wallT <= 8.0 && !insideGlass) {
+                    vec3 wallHit = position + direction * wallT;
+                    float dispersionScale = settings.geometry.w * 0.032 * wallT;
+                    const vec3 spectralSign = vec3(1.0, 0.0, -0.72);
+                    for (uint channel = 0u; channel < 3u; ++channel) {
+                        vec2 dispersedHit = wallHit.xy + spectralBend *
+                            (spectralSign[channel] * dispersionScale);
+                        float energy = settings.light.z * settings.light.w *
+                                       transmission[channel];
+                        depositedAny = splat(dispersedHit, channel, energy,
+                            sequence ^ (channel * 0x119de1f3u)) || depositedAny;
+                    }
+                } else {
+                    atomicAdd(groupWallMisses, 1u);
+                }
+                terminated = true;
+                break;
+            }
+        }
+
+        ++interfaceCount;
+#ifdef GLASSLIGHT_FRACTURE_SHADER
+        vec3 outwardNormal = interfaceNormal;
+#else
+        vec3 outwardNormal = glassNormal(interfacePoint);
+#endif
+        bool entering = !insideGlass;
+        vec3 orientedNormal = entering ? outwardNormal : -outwardNormal;
+        orientedNormal = roughenNormal(orientedNormal,
+            sequence ^ uint(interfaceIndex * 0x45d9f3b), settings.optical.y);
+        float eta = entering ? (1.0 / ior) : ior;
+        vec3 transmittedDirection = refract(direction, orientedNormal, eta);
+        if (dot(transmittedDirection, transmittedDirection) < 0.2) {
+            direction = reflect(direction, orientedNormal);
+            ++reflectionCount;
+        } else {
+            float bend = 1.0 - clamp(-dot(direction, orientedNormal), 0.0, 1.0);
+            spectralBend += orientedNormal.xy * bend * (entering ? 1.0 : -1.0);
+            transmission *= fresnelLoss;
+            direction = normalize(transmittedDirection);
+            insideGlass = !insideGlass;
+        }
+        position = interfacePoint + direction * 0.0032;
+    }
+
+    atomicAdd(groupInterfaces, interfaceCount);
+    if (reflectionCount > 0u) atomicAdd(groupReflections, reflectionCount);
+    if (!terminated && !depositedAny) atomicAdd(groupExhausted, 1u);
+    if (depositedAny) atomicAdd(groupDeposited, 1u);
+}
+
+void main() {
+    if (gl_LocalInvocationID.x == 0u) {
+        groupDeposited = 0u;
+        groupReflections = 0u;
+        groupObjectHits = 0u;
+        groupWallMisses = 0u;
+        groupInterfaces = 0u;
+        groupExhausted = 0u;
+    }
+    barrier();
+    uint localSample = gl_GlobalInvocationID.x;
+    if (localSample < pc.dispatchSamples) tracePhoton(localSample);
+    barrier();
+    if (gl_LocalInvocationID.x == 0u) {
+        atomicAdd(statistics.deposited, groupDeposited);
+        atomicAdd(statistics.internalReflections, groupReflections);
+        atomicAdd(statistics.objectHits, groupObjectHits);
+        atomicAdd(statistics.wallMisses, groupWallMisses);
+        atomicAdd(statistics.interfaceEvents, groupInterfaces);
+        atomicAdd(statistics.traversalExhausted, groupExhausted);
+    }
+}

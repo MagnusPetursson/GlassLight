@@ -1,0 +1,222 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 1, std430) writeonly buffer OutputPixels {
+    uint pixels[];
+} outputPixels;
+
+layout(set = 0, binding = 2, std430) buffer Statistics {
+    uint deposited;
+    uint internalReflections;
+    uint objectHits;
+    uint wallMisses;
+    uint interfaceEvents;
+    uint traversalExhausted;
+    uint previewHits;
+    uint reserved;
+} statistics;
+
+struct FractureShardGpu {
+    vec4 baseLength;
+    vec4 axisRadius;
+    vec4 basisTip;
+    vec4 separationProfile;
+    uvec4 paletteSidesPlanes;
+};
+
+struct FracturePlaneSetGpu {
+    vec4 values[13];
+};
+
+layout(set = 0, binding = 3, std430) readonly buffer Settings {
+    vec4 palette[5];
+    uvec4 shapeRegion;
+    vec4 geometry;
+    vec4 optical;
+    vec4 light;
+    vec4 rotation;
+    uvec4 renderOptions;
+#ifdef GLASSLIGHT_FRACTURE_SHADER
+    uvec4 fractureInfo;
+    vec4 fractureBounds;
+    FractureShardGpu fractureShards[16];
+    FracturePlaneSetGpu fracturePlanes[16];
+#endif
+} settings;
+
+#include "geometry.glsl"
+
+layout(push_constant) uniform PreviewPush {
+    uint width;
+    uint height;
+    uint edgeOverlay;
+    uint padding;
+    float orbitYaw;
+    float orbitPitch;
+    float zoom;
+    float padding2;
+} pc;
+
+bool previewMarch(vec3 origin, vec3 direction, float maximumDistance,
+                  out vec3 hit, out float traveled, out vec3 hitNormal) {
+#ifdef GLASSLIGHT_FRACTURE_SHADER
+    return glassFractureNextInterface(origin, direction, maximumDistance,
+                                      hit, traveled, hitNormal);
+#else
+    traveled = 0.0;
+    for (int step = 0; step < 192; ++step) {
+        hit = origin + direction * traveled;
+        float d = abs(glassSdf(hit));
+        if (d < 0.0011 && traveled > 0.0005) {
+            hitNormal = glassNormal(hit);
+            return true;
+        }
+        traveled += max(d * 0.55, 0.0014);
+        if (traveled >= maximumDistance) return false;
+    }
+    return false;
+#endif
+}
+
+vec3 studioEnvironment(vec3 direction) {
+    direction = normalize(direction);
+    float vertical = direction.y * 0.5 + 0.5;
+    vec3 low = vec3(0.018, 0.032, 0.043);
+    vec3 high = vec3(0.12, 0.18, 0.21);
+    vec3 environment = mix(low, high, smoothstep(0.0, 1.0, vertical));
+    float key = pow(max(dot(direction, normalize(vec3(-0.55, 0.72, -0.42))), 0.0), 48.0);
+    float strip = pow(max(dot(direction, normalize(vec3(0.78, 0.25, 0.56))), 0.0), 110.0);
+    float warm = pow(max(dot(direction, normalize(vec3(-0.25, -0.15, 0.96))), 0.0), 70.0);
+    return environment + vec3(0.82, 0.92, 1.0) * key * 1.8 +
+           vec3(0.42, 0.82, 0.88) * strip * 1.25 +
+           vec3(0.95, 0.48, 0.24) * warm * 0.32;
+}
+
+vec3 previewGlass(vec3 origin, vec3 direction, vec3 firstHit, vec3 firstNormal) {
+    float ior = max(settings.optical.x, 1.01);
+    vec3 position = firstHit;
+    bool insideGlass = false;
+    vec3 throughput = vec3(1.0);
+    vec3 radiance = vec3(0.0);
+    vec3 interfaceNormal = firstNormal;
+
+#ifdef GLASSLIGHT_FRACTURE_SHADER
+    const int maximumInterfaces = 16;
+#else
+    const int maximumInterfaces = 8;
+#endif
+    for (int interfaceIndex = 0; interfaceIndex < maximumInterfaces; ++interfaceIndex) {
+        if (interfaceIndex >= maximumInterfaces) break;
+        vec3 outwardNormal = interfaceNormal;
+        bool entering = !insideGlass;
+        vec3 orientedNormal = entering ? outwardNormal : -outwardNormal;
+        float eta = entering ? 1.0 / ior : ior;
+        float cosine = clamp(-dot(direction, orientedNormal), 0.0, 1.0);
+        float f0 = pow((ior - 1.0) / (ior + 1.0), 2.0);
+        float fresnel = f0 + (1.0 - f0) * pow(1.0 - cosine, 5.0);
+        radiance += throughput * fresnel * studioEnvironment(reflect(direction, orientedNormal));
+
+        vec3 nextDirection = refract(direction, orientedNormal, eta);
+        if (dot(nextDirection, nextDirection) < 0.2) {
+            direction = reflect(direction, orientedNormal);
+        } else {
+            direction = normalize(nextDirection);
+            throughput *= 1.0 - fresnel;
+            insideGlass = !insideGlass;
+        }
+        position += direction * 0.0032;
+
+        vec3 nextHit;
+        float segmentLength;
+        vec3 nextNormal;
+        if (!previewMarch(position, direction, 6.0, nextHit, segmentLength, nextNormal)) {
+            radiance += throughput * studioEnvironment(direction);
+            break;
+        }
+        if (insideGlass) {
+            vec3 midpoint = position + direction * (segmentLength * 0.5);
+            vec3 tint = glassRegionTint(glassWorldToLocal(midpoint));
+            vec3 absorption = (vec3(1.0) - tint) *
+                              (0.38 + 2.0 * settings.geometry.z);
+            throughput *= exp(-segmentLength * absorption);
+            radiance += throughput * tint * 0.025;
+        }
+        position = nextHit;
+        interfaceNormal = nextNormal;
+    }
+    return radiance;
+}
+
+vec3 acesFilm(vec3 x) {
+    return clamp((x * (2.51 * x + 0.03)) /
+                 (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+float linearToSrgb(float x) {
+    return x <= 0.0031308 ? 12.92 * x : 1.055 * pow(x, 1.0 / 2.4) - 0.055;
+}
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= pc.width || pixel.y >= pc.height) return;
+    uint index = pixel.y * pc.width + pixel.x;
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(pc.width, pc.height) * 2.0 - 1.0;
+    uv.x *= float(pc.width) / max(float(pc.height), 1.0);
+
+    float cp = cos(pc.orbitPitch);
+    vec3 cameraDirection = normalize(vec3(cp * sin(pc.orbitYaw),
+                                         sin(pc.orbitPitch),
+                                         cp * cos(pc.orbitYaw)));
+    vec3 boundsCenter = glassObjectBoundsCenter();
+#ifdef GLASSLIGHT_FRACTURE_SHADER
+    float framingScale = max(glassObjectBoundsRadius(), 0.72);
+#else
+    float framingScale = 1.0;
+#endif
+    float cameraDistance = 3.15 * framingScale / clamp(pc.zoom, 0.45, 2.4);
+    vec3 camera = boundsCenter + cameraDirection * cameraDistance;
+    vec3 forward = normalize(boundsCenter - camera);
+    vec3 right = normalize(cross(forward, vec3(0.0, 1.0, 0.0)));
+    vec3 up = normalize(cross(right, forward));
+    vec3 direction = normalize(forward + right * uv.x * 0.53 + up * uv.y * 0.53);
+
+    vec3 hit;
+    float traveled;
+    vec3 hitNormal;
+    vec3 color;
+    if (previewMarch(camera, direction, 7.0 * framingScale, hit, traveled, hitNormal)) {
+        atomicAdd(statistics.previewHits, 1u);
+        vec3 normal = hitNormal;
+        color = previewGlass(camera, direction, hit, hitNormal);
+        float facing = 1.0 - abs(dot(normal, direction));
+        color += vec3(0.20, 0.43, 0.48) * pow(facing, 3.0) * 0.28;
+        if (pc.edgeOverlay != 0u) {
+            float e = 0.007;
+            float curvature = length(normal - glassNormal(hit + right * e)) +
+                              length(normal - glassNormal(hit + up * e));
+#ifdef GLASSLIGHT_FRACTURE_SHADER
+            float exactEdge = glassFractureEdgeProximity(hit);
+#else
+            float exactEdge = 0.0;
+#endif
+            float edge = max(exactEdge, smoothstep(0.055, 0.24, curvature)) +
+                         pow(facing, 8.0) * 0.35;
+            color = mix(color, vec3(0.62, 0.94, 0.96), clamp(edge * 0.38, 0.0, 0.55));
+        }
+    } else {
+        color = studioEnvironment(direction) * 0.42;
+        float floorT = direction.y < -0.001 ? (-0.92 - camera.y) / direction.y : -1.0;
+        if (floorT > 0.0) {
+            vec3 floorPoint = camera + direction * floorT;
+            float vignette = exp(-dot(floorPoint.xz, floorPoint.xz) * 0.18);
+            color = mix(color, vec3(0.025, 0.044, 0.052), 0.72 + 0.18 * vignette);
+        }
+    }
+
+    color = acesFilm(color * 1.18);
+    color = vec3(linearToSrgb(color.r), linearToSrgb(color.g), linearToSrgb(color.b));
+    uvec3 rgb = uvec3(clamp(color * 255.0 + 0.5, 0.0, 255.0));
+    outputPixels.pixels[index] = rgb.r | (rgb.g << 8u) | (rgb.b << 16u) | 0xff000000u;
+}

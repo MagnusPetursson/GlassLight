@@ -1,0 +1,7 @@
+/build/
+/dist/
+/.cache/
+*.AppImage
+*.deb
+SHA256SUMS
+imgui.ini

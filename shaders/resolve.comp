@@ -1,0 +1,99 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Accumulation {
+    uint values[];
+} accumulation;
+
+layout(set = 0, binding = 1, std430) writeonly buffer OutputPixels {
+    uint pixels[];
+} outputPixels;
+
+layout(push_constant) uniform ResolvePush {
+    uint width;
+    uint height;
+    uint sampleCount;
+    uint padding;
+    float exposure;
+    float wallR;
+    float wallG;
+    float wallB;
+    float wallGrain;
+    float projectionStrength;
+    uint seed;
+    uint wallPreset;
+} pc;
+
+uint hash32(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    return x ^ (x >> 16);
+}
+
+vec3 accumulatedAt(ivec2 position) {
+    position = clamp(position, ivec2(0), ivec2(int(pc.width) - 1, int(pc.height) - 1));
+    uint index = (uint(position.y) * pc.width + uint(position.x)) * 3u;
+    return vec3(accumulation.values[index], accumulation.values[index + 1u],
+                accumulation.values[index + 2u]);
+}
+
+vec3 acesFilm(vec3 x) {
+    const float a = 2.51;
+    const float b = 0.03;
+    const float c = 2.43;
+    const float d = 0.59;
+    const float e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+float linearToSrgb(float x) {
+    return x <= 0.0031308 ? 12.92 * x : 1.055 * pow(x, 1.0 / 2.4) - 0.055;
+}
+
+shared vec3 gaussianTile[18][18];
+
+void main() {
+    uint localIndex = gl_LocalInvocationID.y * 16u + gl_LocalInvocationID.x;
+    ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy) * 16 - ivec2(1);
+    for (uint tileIndex = localIndex; tileIndex < 324u; tileIndex += 256u) {
+        ivec2 tilePosition = ivec2(int(tileIndex % 18u), int(tileIndex / 18u));
+        gaussianTile[tilePosition.y][tilePosition.x] =
+            accumulatedAt(tileOrigin + tilePosition);
+    }
+    barrier();
+
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= pc.width || pixel.y >= pc.height) return;
+    uint index = pixel.y * pc.width + pixel.x;
+    // A compact 1-2-1 Gaussian makes sparse live photon splats cohere
+    // while retaining the narrow folds that give the projection its character.
+    // The 18x18 workgroup tile turns 2,304 global RGB reads into 324.
+    const float kernel[3] = float[3](1.0, 2.0, 1.0);
+    vec3 accumulated = vec3(0.0);
+    for (int oy = -1; oy <= 1; ++oy) {
+        for (int ox = -1; ox <= 1; ++ox) {
+            ivec2 tilePosition = ivec2(gl_LocalInvocationID.xy) +
+                                 ivec2(ox + 1, oy + 1);
+            accumulated += gaussianTile[tilePosition.y][tilePosition.x] *
+                           kernel[ox + 1] * kernel[oy + 1];
+        }
+    }
+    accumulated *= 1.0 / 16.0;
+    // Fixed-point splats are scaled by 128 in the trace shader. Keep the
+    // resolve exposure conservative so concentrated folds retain color and do
+    // not collapse to white.
+    float normalization = 116.0 / max(float(pc.sampleCount), 1.0);
+
+    float noise = float(hash32(index ^ pc.seed) & 0xffffu) / 65535.0 - 0.5;
+    vec3 wallColor = vec3(pc.wallR, pc.wallG, pc.wallB);
+    float wallLevel = pc.wallPreset == 3u ? 0.055 : 0.10;
+    vec3 wall = wallColor * wallLevel * (1.0 + noise * pc.wallGrain * 0.055);
+    vec3 hdr = wall + accumulated * normalization * pc.exposure;
+    vec3 mapped = acesFilm(hdr);
+    vec3 srgb = vec3(linearToSrgb(mapped.r), linearToSrgb(mapped.g), linearToSrgb(mapped.b));
+    uvec3 rgb = uvec3(clamp(srgb * 255.0 + 0.5, 0.0, 255.0));
+    outputPixels.pixels[index] = rgb.r | (rgb.g << 8u) | (rgb.b << 16u) | 0xff000000u;
+}

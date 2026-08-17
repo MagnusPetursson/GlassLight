@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>is.magnusp.glasslight</id>
+  <name>GlassLight</name>
+  <summary>Create generative art from refracted light</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="is.magnusp">
+    <name>Magnus Petursson</name>
+  </developer>
+  <url type="homepage">https://github.com/MagnusPetursson/GlassLight</url>
+  <description>
+    <p>GlassLight traces light through seeded, procedural glass forms and renders only the resulting colored caustics on a textured wall.</p>
+    <p>Explore Pebble, Lens, Ribbon, Faceted Vessel, Cut Crystal, and Fracture forms through a responsive GPU preview, refine still images, and export seamless video loops.</p>
+  </description>
+  <launchable type="desktop-id">is.magnusp.glasslight.desktop</launchable>
+  <provides>
+    <binary>glasslight</binary>
+  </provides>
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.2.0" date="2026-08-14">
+      <description>
+        <p>Adds Faceted Vessel, Cut Crystal, and Fracture families, with GPU-rendered preview validation and expanded deterministic export checks.</p>
+      </description>
+    </release>
+    <release version="0.1.0" date="2026-07-21" type="development"/>
+  </releases>
+</component>
