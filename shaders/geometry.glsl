@@ -15,10 +15,9 @@ float glassRandom01(uint x) {
     return float(glassHash32(x)) * (1.0 / 4294967296.0);
 }
 
-vec3 glassRotateAxis(vec3 point, vec3 axis, float angle) {
-    float c = cos(angle);
-    float s = sin(angle);
-    return point * c + cross(axis, point) * s + axis * dot(axis, point) * (1.0 - c);
+vec3 glassRotateQuaternion(vec3 point, vec4 rotation) {
+    return point + 2.0 * cross(rotation.xyz,
+        cross(rotation.xyz, point) + rotation.w * point);
 }
 
 vec3 glassQuarterTurn(vec3 p, uint turn) {
@@ -52,20 +51,18 @@ float glassRegularSupport(vec2 p, uint sides) {
     return max(support, abs(s30 * p.x - c30 * p.y));
 }
 
+#ifndef GLASSLIGHT_FRACTURE_SHADER
 float glassPebbleLocal(vec3 p, uint seed) {
-    vec3 stretch = vec3(0.88 + 0.12 * glassRandom01(seed ^ 0x21u),
-                        1.02 + 0.15 * glassRandom01(seed ^ 0x37u),
-                        0.83 + 0.16 * glassRandom01(seed ^ 0x51u));
+    vec3 stretch = settings.legacyShape[0].xyz;
     vec3 q = p / stretch;
-    float seedWarp = float(seed & 255u) / 255.0 - 0.5;
+    float seedWarp = settings.legacyShape[1].x;
     float ripple = 0.055 * (q.x * q.y + 0.7 * q.y * q.z + 0.5 * q.z * q.x) +
                    0.018 * seedWarp * (q.x * q.x - q.z * q.z);
-    return (length(q) - (0.68 + ripple)) * min(stretch.x, min(stretch.y, stretch.z));
+    return (length(q) - (0.68 + ripple)) * settings.legacyShape[0].w;
 }
 
 float glassLensLocal(vec3 p, uint seed) {
-    float ellipticity = 0.88 + 0.15 * glassRandom01(seed ^ 0x718u);
-    vec2 q = p.xy / vec2(ellipticity, 1.0 / ellipticity);
+    vec2 q = p.xy / settings.legacyShape[0].xy;
     float radial = length(q);
     float faces = abs(p.z) + 0.58 * radial * radial - 0.39;
     float rim = radial - 0.78;
@@ -80,12 +77,12 @@ float glassRibbonLocal(vec3 p, uint seed) {
                       2.0 * unit.x * unit.y);
     vec2 turn3 = vec2(turn2.x * unit.x - turn2.y * unit.y,
                       turn2.x * unit.y + turn2.y * unit.x);
-    vec2 twist = ((seed >> 5u) & 1u) == 0u ? turn2 : turn3;
+    vec2 twist = settings.legacyShape[0].x < 2.5 ? turn2 : turn3;
     vec2 crossSection = vec2(radial - 0.48, p.z);
     mat2 turn = mat2(twist.x, -twist.y, twist.y, twist.x);
     crossSection = turn * crossSection;
     crossSection.x /= 1.45;
-    float waviness = 0.035 * turn3.x * (((seed >> 7u) & 1u) == 0u ? 1.0 : -1.0);
+    float waviness = 0.035 * turn3.x * settings.legacyShape[0].y;
     return length(crossSection) - (0.22 + waviness);
 }
 
@@ -93,9 +90,9 @@ float glassRibbonLocal(vec3 p, uint seed) {
 // from a bounded, seeded faceted outer body. Its raised cavity floor leaves a
 // physically thick glass base while the top remains genuinely open.
 float glassFacetedVesselLocal(vec3 p, uint seed) {
-    uint sides = 8u + 2u * ((seed >> 9u) % 3u);
+    uint sides = uint(settings.legacyShape[0].x);
     float y = p.y;
-    uint profile = glassHash32(seed ^ 0x243f6a88u) % 4u;
+    uint profile = uint(settings.legacyShape[0].y);
     float waist;
     if (profile == 0u) {
         float shoulder = max(0.0, 1.0 - abs(y + 0.08) * 1.35);
@@ -110,15 +107,15 @@ float glassFacetedVesselLocal(vec3 p, uint seed) {
         float wave = abs(fract((y + 0.42) * 0.80) * 2.0 - 1.0);
         waist = 0.49 + 0.052 * (1.0 - 2.0 * wave) + 0.03 * y;
     }
-    waist *= 0.96 + 0.08 * glassRandom01(seed ^ 0x85ebca6bu);
-    vec2 facetPoint = ((seed >> 15u) & 1u) == 0u ? p.xz :
+    waist *= settings.legacyShape[0].z;
+    vec2 facetPoint = settings.legacyShape[0].w < 0.5 ? p.xz :
         vec2((p.x + p.z) * 0.7071067812, (p.z - p.x) * 0.7071067812);
     float support = glassRegularSupport(facetPoint, sides);
     float outerRadial = support - waist;
     float outerCaps = max(-0.79 - y, y - 0.78);
     float outer = max(outerRadial, outerCaps);
 
-    float wallThickness = 0.085 + 0.015 * glassRandom01(seed ^ 0xc2b2ae35u);
+    float wallThickness = settings.legacyShape[1].x;
     float innerRadius = max(waist - wallThickness, 0.24);
     float innerRadial = support - innerRadius;
     float cavityFloor = -0.45 - y;
@@ -127,14 +124,14 @@ float glassFacetedVesselLocal(vec3 p, uint seed) {
 }
 
 float glassCutReliefLocal(vec3 p, uint seed, float outerRadius, float radialLength) {
-    vec2 q = ((seed >> 13u) & 1u) == 0u ? p.xz :
+    vec2 q = settings.legacyShape[0].y < 0.5 ? p.xz :
         vec2((p.x + p.z) * 0.7071067812, (p.z - p.x) * 0.7071067812);
     // Wheel cuts stay in the outer half of the wall: visibly subtractive, but
     // not accidental perforations that manufacture extra optical interfaces.
     float radialBand = abs(radialLength - (outerRadius - 0.006)) - 0.032;
     float nearestAxis = min(abs(q.x), abs(q.y));
     float nearestDiagonal = min(abs(q.x + q.y), abs(q.x - q.y)) * 0.7071067812;
-    uint mixVariant = (seed >> 19u) & 3u;
+    uint mixVariant = uint(settings.legacyShape[0].z);
     if (mixVariant == 0u) {
         float diamond = max(0.55 * (nearestDiagonal + abs(p.y + 0.05)) - 0.10,
                             radialBand);
@@ -168,7 +165,7 @@ float glassCutReliefLocal(vec3 p, uint seed, float outerRadius, float radialLeng
 float glassCutCrystalLocal(vec3 p, uint seed) {
     float y = p.y;
     float outerRadius = 0.50 + 0.075 * smoothstep(-0.70, 0.69, y);
-    vec2 q = ((seed >> 7u) & 1u) == 0u ? p.xz :
+    vec2 q = settings.legacyShape[0].x < 0.5 ? p.xz :
         vec2((p.x + p.z) * 0.7071067812, (p.z - p.x) * 0.7071067812);
     float primarySupport = glassRegularSupport(q, 12u);
     float bevelSupport = length(q);
@@ -187,6 +184,7 @@ float glassCutCrystalLocal(vec3 p, uint seed) {
     float relief = glassCutReliefLocal(p, seed, outerRadius, bevelSupport);
     return max(shell, -relief);
 }
+#endif
 
 #ifdef GLASSLIGHT_FRACTURE_SHADER
 bool glassFractureShardContains(vec3 p, uint shardIndex, float tolerance) {
@@ -230,14 +228,28 @@ float glassFractureLocal(vec3 p) {
 #endif
 
 vec3 glassWorldToLocal(vec3 worldPoint) {
-    vec3 axis = normalize(settings.rotation.xyz);
-    return glassRotateAxis(worldPoint, axis, -settings.rotation.w * 2.0 * GL_PI) /
+    vec4 inverseRotation = vec4(-settings.rotation.xyz, settings.rotation.w);
+    return glassRotateQuaternion(worldPoint, inverseRotation) /
            max(settings.geometry.x, 0.05);
 }
 
 float glassSdfLocal(vec3 p) {
 #ifdef GLASSLIGHT_FRACTURE_SHADER
     return glassFractureLocal(p);
+#else
+#ifdef GLASSLIGHT_FAMILY
+    uint seed = settings.shapeRegion.w;
+#if GLASSLIGHT_FAMILY == 2
+    return glassLensLocal(p, seed);
+#elif GLASSLIGHT_FAMILY == 3
+    return glassRibbonLocal(p, seed);
+#elif GLASSLIGHT_FAMILY == 4
+    return glassFacetedVesselLocal(p, seed);
+#elif GLASSLIGHT_FAMILY == 5
+    return glassCutCrystalLocal(p, seed);
+#else
+    return glassPebbleLocal(p, seed);
+#endif
 #else
     uint family = settings.shapeRegion.x;
     uint seed = settings.shapeRegion.w;
@@ -247,6 +259,7 @@ float glassSdfLocal(vec3 p) {
     if (family == 5u) return glassCutCrystalLocal(p, seed);
     return glassPebbleLocal(p, seed);
 #endif
+#endif
 }
 
 // Negative means glass. Positive means air, including vessel cavities and the
@@ -254,6 +267,49 @@ float glassSdfLocal(vec3 p) {
 float glassSdf(vec3 worldPoint) {
     return glassSdfLocal(glassWorldToLocal(worldPoint)) * max(settings.geometry.x, 0.05);
 }
+
+#ifndef GLASSLIGHT_FRACTURE_SHADER
+vec3 glassLegacyNormalFromLocal(vec3 localPoint) {
+    const float e = 0.00125;
+    const vec3 k1 = vec3(1.0, -1.0, -1.0);
+    const vec3 k2 = vec3(-1.0, -1.0, 1.0);
+    const vec3 k3 = vec3(-1.0, 1.0, -1.0);
+    const vec3 k4 = vec3(1.0, 1.0, 1.0);
+    vec3 localNormal = normalize(k1 * glassSdfLocal(localPoint + k1 * e) +
+                                 k2 * glassSdfLocal(localPoint + k2 * e) +
+                                 k3 * glassSdfLocal(localPoint + k3 * e) +
+                                 k4 * glassSdfLocal(localPoint + k4 * e));
+    return normalize(glassRotateQuaternion(localNormal, settings.rotation));
+}
+
+// Transform the ray once, then retain local-space state for the entire march.
+// Distances remain in world units so callers preserve their existing limits.
+bool glassLegacyNextInterface(vec3 worldOrigin, vec3 worldDirection,
+                              float maximumDistance, int maximumSteps,
+                              float hitEpsilon, float safety, float minimumStep,
+                              out vec3 hit, out float traveled,
+                              out vec3 outwardNormal) {
+    float scale = max(settings.geometry.x, 0.05);
+    vec4 inverseRotation = vec4(-settings.rotation.xyz, settings.rotation.w);
+    vec3 localOrigin = glassRotateQuaternion(worldOrigin, inverseRotation) / scale;
+    vec3 localDirection = normalize(
+        glassRotateQuaternion(worldDirection, inverseRotation));
+    traveled = 0.0;
+    for (int step = 0; step < 192; ++step) {
+        if (step >= maximumSteps) break;
+        vec3 localPoint = localOrigin + localDirection * (traveled / scale);
+        float worldDistance = abs(glassSdfLocal(localPoint)) * scale;
+        if (worldDistance < hitEpsilon && traveled > 0.0005) {
+            hit = worldOrigin + worldDirection * traveled;
+            outwardNormal = glassLegacyNormalFromLocal(localPoint);
+            return true;
+        }
+        traveled += max(worldDistance * safety, minimumStep);
+        if (traveled >= maximumDistance) return false;
+    }
+    return false;
+}
+#endif
 
 vec3 glassNormal(vec3 p) {
 #ifdef GLASSLIGHT_FRACTURE_SHADER
@@ -276,20 +332,10 @@ vec3 glassNormal(vec3 p) {
                 }
             }
         }
-        vec3 axis = normalize(settings.rotation.xyz);
-        return normalize(glassRotateAxis(bestNormal, axis,
-                                         settings.rotation.w * 2.0 * GL_PI));
+        return normalize(glassRotateQuaternion(bestNormal, settings.rotation));
     }
 #else
-    const float e = 0.00125;
-    const vec3 k1 = vec3(1.0, -1.0, -1.0);
-    const vec3 k2 = vec3(-1.0, -1.0, 1.0);
-    const vec3 k3 = vec3(-1.0, 1.0, -1.0);
-    const vec3 k4 = vec3(1.0, 1.0, 1.0);
-    return normalize(k1 * glassSdf(p + k1 * e) +
-                     k2 * glassSdf(p + k2 * e) +
-                     k3 * glassSdf(p + k3 * e) +
-                     k4 * glassSdf(p + k4 * e));
+    return glassLegacyNormalFromLocal(glassWorldToLocal(p));
 #endif
 }
 
@@ -332,6 +378,15 @@ bool glassFractureRayInterval(vec3 origin, vec3 direction, uint shardIndex,
     return exitT >= max(enterT, 0.0);
 }
 
+bool glassFractureGroupHit(vec3 origin, vec3 direction, uint groupIndex) {
+    vec4 bound = settings.fractureGroupBounds[groupIndex];
+    if (bound.w <= 0.0) return false;
+    vec3 relativeOrigin = origin - bound.xyz;
+    float b = dot(relativeOrigin, direction);
+    float c = dot(relativeOrigin, relativeOrigin) - bound.w * bound.w;
+    return b * b - c >= 0.0;
+}
+
 vec3 glassFractureBoundaryNormal(vec3 localPoint, uint shardIndex) {
     vec3 result = vec3(0.0, 1.0, 0.0);
     float nearest = 1e10;
@@ -355,10 +410,9 @@ bool glassFractureNextInterface(vec3 worldOrigin, vec3 worldDirection,
                                 float maximumDistance, out vec3 hit,
                                 out float traveled, out vec3 outwardNormal) {
     float scale = max(settings.geometry.x, 0.05);
-    vec3 axis = normalize(settings.rotation.xyz);
-    float angle = -settings.rotation.w * 2.0 * GL_PI;
+    vec4 inverseRotation = vec4(-settings.rotation.xyz, settings.rotation.w);
     vec3 origin = glassWorldToLocal(worldOrigin);
-    vec3 direction = normalize(glassRotateAxis(worldDirection, axis, angle));
+    vec3 direction = normalize(glassRotateQuaternion(worldDirection, inverseRotation));
     float maximumLocal = maximumDistance / scale;
     float cursor = 0.00045 / scale;
     uint count = min(settings.fractureInfo.x, 16u);
@@ -371,18 +425,24 @@ bool glassFractureNextInterface(vec3 worldOrigin, vec3 worldDirection,
     for (uint shard = 0u; shard < 16u; ++shard) {
         enters[shard] = 1e10;
         exits[shard] = -1e10;
-        if (shard >= count) continue;
-        if (!glassFractureRayInterval(origin, direction, shard,
-                                      enters[shard], exits[shard])) continue;
-        if (enters[shard] <= cursor && exits[shard] >= cursor) {
-            startsInside = true;
-            if (exits[shard] > componentExit) {
-                componentExit = exits[shard];
+    }
+    for (uint group = 0u; group < 4u; ++group) {
+        if (!glassFractureGroupHit(origin, direction, group)) continue;
+        for (uint localShard = 0u; localShard < 4u; ++localShard) {
+            uint shard = group * 4u + localShard;
+            if (shard >= count) break;
+            if (!glassFractureRayInterval(origin, direction, shard,
+                                          enters[shard], exits[shard])) continue;
+            if (enters[shard] <= cursor && exits[shard] >= cursor) {
+                startsInside = true;
+                if (exits[shard] > componentExit) {
+                    componentExit = exits[shard];
+                    boundaryShard = shard;
+                }
+            } else if (enters[shard] >= cursor && enters[shard] < nextEntry) {
+                nextEntry = enters[shard];
                 boundaryShard = shard;
             }
-        } else if (enters[shard] >= cursor && enters[shard] < nextEntry) {
-            nextEntry = enters[shard];
-            boundaryShard = shard;
         }
     }
 
@@ -411,7 +471,7 @@ bool glassFractureNextInterface(vec3 worldOrigin, vec3 worldDirection,
     hit = worldOrigin + worldDirection * traveled;
     vec3 boundaryNormal = glassFractureBoundaryNormal(origin + direction * nextT,
                                                       boundaryShard);
-    outwardNormal = normalize(glassRotateAxis(boundaryNormal, axis, -angle));
+    outwardNormal = normalize(glassRotateQuaternion(boundaryNormal, settings.rotation));
     return true;
 }
 
@@ -442,9 +502,8 @@ float glassFractureEdgeProximity(vec3 worldPoint) {
 
 vec3 glassObjectBoundsCenter() {
 #ifdef GLASSLIGHT_FRACTURE_SHADER
-    vec3 axis = normalize(settings.rotation.xyz);
     vec3 localCenter = settings.fractureBounds.xyz * max(settings.geometry.x, 0.05);
-    return glassRotateAxis(localCenter, axis, settings.rotation.w * 2.0 * GL_PI);
+    return glassRotateQuaternion(localCenter, settings.rotation);
 #else
     return vec3(0.0);
 #endif
@@ -461,17 +520,12 @@ float glassObjectBoundsRadius() {
 
 #ifndef GLASSLIGHT_FRACTURE_SHADER
 vec3 glassCellPosition(uint index) {
-    uint base = glassHash32(settings.shapeRegion.w ^ (index * 0x9e3779b9u));
-    return vec3(glassRandom01(base), glassRandom01(base ^ 0x68bc21ebu),
-                glassRandom01(base ^ 0x02e5be93u)) * 1.7 - 0.85;
+    return settings.legacyCells[index].xyz;
 }
 
 vec3 glassCellTint(uint index) {
-    if (settings.shapeRegion.z != 0u &&
-        glassHash32(settings.shapeRegion.w + index * 19u) % 5u == 0u) {
-        return vec3(0.975);
-    }
-    return settings.palette[index % 5u].rgb;
+    uint tintIndex = floatBitsToUint(settings.legacyCells[index].w);
+    return tintIndex == 5u ? vec3(0.975) : settings.palette[tintIndex].rgb;
 }
 
 vec3 glassRegionTint(vec3 localPoint) {

@@ -24,8 +24,17 @@ try {
         "shaders/glass_preview.comp.spv",
         "shaders/first_light.comp.fracture.spv",
         "shaders/glass_preview.comp.fracture.spv",
+        "shaders/first_light.comp.group128.fracture.spv",
+        "shaders/glass_preview.comp.group8.fracture.spv",
+        "shaders/resolve.comp.group8.spv",
         "shaders/resolve.comp.spv"
     )
+    foreach ($family in 1..5) {
+        $expected += "shaders/first_light.comp.family$family.spv"
+        $expected += "shaders/glass_preview.comp.family$family.spv"
+        $expected += "shaders/first_light.comp.group128.family$family.spv"
+        $expected += "shaders/glass_preview.comp.group8.family$family.spv"
+    }
     foreach ($relative in $expected) {
         if (!(Test-Path (Join-Path $root $relative) -PathType Leaf)) {
             throw "Missing packaged artifact: $relative"

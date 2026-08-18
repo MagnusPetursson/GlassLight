@@ -1,7 +1,10 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 
-layout(local_size_x = 256) in;
+#ifndef GLASSLIGHT_TRACE_GROUP_SIZE
+#define GLASSLIGHT_TRACE_GROUP_SIZE 256
+#endif
+layout(local_size_x = GLASSLIGHT_TRACE_GROUP_SIZE) in;
 
 layout(set = 0, binding = 0, std430) buffer Accumulation {
     uint values[];
@@ -48,8 +51,12 @@ layout(set = 0, binding = 3, std430) readonly buffer Settings {
 #ifdef GLASSLIGHT_FRACTURE_SHADER
     uvec4 fractureInfo; // count, resolved morphology, resolved motion, reserved
     vec4 fractureBounds; // local center.xyz, conservative radius
+    vec4 fractureGroupBounds[4];
     FractureShardGpu fractureShards[16];
     FracturePlaneSetGpu fracturePlanes[16];
+#else
+    vec4 legacyShape[4];
+    vec4 legacyCells[24]; // local position.xyz, uintBitsToFloat(tint index)
 #endif
 } settings;
 
@@ -91,26 +98,17 @@ vec3 roughenNormal(vec3 normal, uint sequence, float roughness) {
 // Conservative unsigned marching is intentionally used here. The glass field
 // may contain thin shells, cavities and disconnected pieces; abs(SDF) plus a
 // sub-unit safety factor finds the next sign boundary from either medium.
-#ifdef GLASSLIGHT_FRACTURE_SHADER
 bool marchNextInterface(vec3 origin, vec3 direction, float maximumDistance,
                         out vec3 hit, out float traveled, out vec3 hitNormal) {
+#ifdef GLASSLIGHT_FRACTURE_SHADER
     return glassFractureNextInterface(origin, direction, maximumDistance,
                                       hit, traveled, hitNormal);
-}
 #else
-bool marchNextInterface(vec3 origin, vec3 direction, float maximumDistance,
-                        out vec3 hit, out float traveled) {
-    traveled = 0.0;
-    for (int step = 0; step < 80; ++step) {
-        hit = origin + direction * traveled;
-        float d = abs(glassSdf(hit));
-        if (d < 0.0012 && traveled > 0.0005) return true;
-        traveled += max(d * 0.82, 0.0017);
-        if (traveled >= maximumDistance) return false;
-    }
-    return false;
-}
+    return glassLegacyNextInterface(origin, direction, maximumDistance, 80,
+                                    0.0012, 0.82, 0.0017,
+                                    hit, traveled, hitNormal);
 #endif
+}
 
 bool intersectObjectBounds(vec3 origin, vec3 direction, out float nearT, out float farT) {
 #ifdef GLASSLIGHT_FRACTURE_SHADER
@@ -178,16 +176,10 @@ void tracePhoton(uint localSample) {
     vec3 boundStart = source + initialDirection * startT;
     vec3 firstInterface;
     float firstTravel;
-#ifdef GLASSLIGHT_FRACTURE_SHADER
     vec3 firstNormal;
     if (!marchNextInterface(boundStart, initialDirection,
                             boundsFar - startT + 0.008,
                             firstInterface, firstTravel, firstNormal)) return;
-#else
-    if (!marchNextInterface(boundStart, initialDirection,
-                            boundsFar - startT + 0.008,
-                            firstInterface, firstTravel)) return;
-#endif
 
     atomicAdd(groupObjectHits, 1u);
     uint quality = min(settings.renderOptions.x, 2u);
@@ -197,7 +189,7 @@ void tracePhoton(uint localSample) {
     int maximumInterfaces = quality == 0u ? 6 : (quality == 1u ? 8 : 12);
 #endif
     float ior = max(settings.optical.x, 1.01);
-    float fresnelLoss = 1.0 - pow((ior - 1.0) / (ior + 1.0), 2.0);
+    float fresnelLoss = 1.0 - uintBitsToFloat(settings.renderOptions.z);
     vec3 position = firstInterface;
     vec3 direction = initialDirection;
     vec3 transmission = vec3(1.0);
@@ -215,9 +207,7 @@ void tracePhoton(uint localSample) {
 #endif
         if (interfaceIndex >= maximumInterfaces) break;
         vec3 interfacePoint = firstInterface;
-#ifdef GLASSLIGHT_FRACTURE_SHADER
         vec3 interfaceNormal = firstNormal;
-#endif
         float segmentLength = 0.0;
         bool foundInterface = interfaceIndex == 0;
 
@@ -228,13 +218,8 @@ void tracePhoton(uint localSample) {
             bool crossesBounds = intersectObjectBounds(position, direction, nextNear, nextFar);
             float objectLimit = crossesBounds ? nextFar + 0.006 : 0.0;
             float limit = wallT > 0.0 ? min(wallT, objectLimit) : objectLimit;
-#ifdef GLASSLIGHT_FRACTURE_SHADER
             foundInterface = limit > 0.0 && marchNextInterface(
                 position, direction, limit, interfacePoint, segmentLength, interfaceNormal);
-#else
-            foundInterface = limit > 0.0 && marchNextInterface(
-                position, direction, limit, interfacePoint, segmentLength);
-#endif
 
             if (insideGlass && segmentLength > 0.0) {
                 vec3 midpoint = position + direction * (segmentLength * 0.5);
@@ -266,11 +251,7 @@ void tracePhoton(uint localSample) {
         }
 
         ++interfaceCount;
-#ifdef GLASSLIGHT_FRACTURE_SHADER
         vec3 outwardNormal = interfaceNormal;
-#else
-        vec3 outwardNormal = glassNormal(interfacePoint);
-#endif
         bool entering = !insideGlass;
         vec3 orientedNormal = entering ? outwardNormal : -outwardNormal;
         orientedNormal = roughenNormal(orientedNormal,

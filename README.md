@@ -25,8 +25,9 @@ the interface.
 
 - Explore six seeded glass families: Pebble, Lens, Ribbon, Faceted Vessel,
   Cut Crystal, and Fracture.
-- Shape the form, palette, material, light source, wall, and motion while the
-  Vulkan renderer updates the canvas.
+- Shape the form, palette, material, light source, wall, and motion while a
+  measured-time Vulkan controller targets a responsive 30 fps canvas and
+  progressively restores the selected Quality ceiling when interaction stops.
 - Inspect the invisible glass itself in an orbitable preview with optional edge
   overlays.
 - Export high-resolution PNG artwork with its complete composition embedded,

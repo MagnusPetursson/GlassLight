@@ -1,6 +1,10 @@
 #version 450
 
-layout(local_size_x = 16, local_size_y = 16) in;
+#ifndef GLASSLIGHT_IMAGE_GROUP_SIZE
+#define GLASSLIGHT_IMAGE_GROUP_SIZE 16
+#endif
+layout(local_size_x = GLASSLIGHT_IMAGE_GROUP_SIZE,
+       local_size_y = GLASSLIGHT_IMAGE_GROUP_SIZE) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer Accumulation {
     uint values[];

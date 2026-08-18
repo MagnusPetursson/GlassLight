@@ -109,6 +109,92 @@ foreach(shader_name IN ITEMS first_light.comp glass_preview.comp)
     )
     list(APPEND GLASSLIGHT_SHADER_BINARIES "${shader_binary}")
 endforeach()
+foreach(shader_name IN ITEMS first_light.comp glass_preview.comp)
+    foreach(family RANGE 1 5)
+        set(shader "${GLASSLIGHT_SHADER_DIR}/${shader_name}")
+        set(shader_binary
+            "${GLASSLIGHT_COMPILED_SHADER_DIR}/${shader_name}.family${family}.spv")
+        add_custom_command(
+            OUTPUT "${shader_binary}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${GLASSLIGHT_COMPILED_SHADER_DIR}"
+            COMMAND Vulkan::glslangValidator -V --target-env vulkan1.2
+                    "-DGLASSLIGHT_FAMILY=${family}"
+                    "-I${GLASSLIGHT_SHADER_DIR}" "${shader}" -o "${shader_binary}"
+            DEPENDS "${shader}" "${GLASSLIGHT_SHADER_DIR}/geometry.glsl"
+            VERBATIM
+        )
+        list(APPEND GLASSLIGHT_SHADER_BINARIES "${shader_binary}")
+    endforeach()
+endforeach()
+
+# Packaged benchmark candidates. Production uses one capability-neutral default
+# (256-thread trace, 16x16 image groups); these alternates let physical release
+# machines compare 128/256 and 8x8/16x16 without vendor-name branches.
+set(resolve_group8_binary "${GLASSLIGHT_COMPILED_SHADER_DIR}/resolve.comp.group8.spv")
+add_custom_command(
+    OUTPUT "${resolve_group8_binary}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${GLASSLIGHT_COMPILED_SHADER_DIR}"
+    COMMAND Vulkan::glslangValidator -V --target-env vulkan1.2
+            -DGLASSLIGHT_IMAGE_GROUP_SIZE=8
+            "-I${GLASSLIGHT_SHADER_DIR}" "${GLASSLIGHT_SHADER_DIR}/resolve.comp"
+            -o "${resolve_group8_binary}"
+    DEPENDS "${GLASSLIGHT_SHADER_DIR}/resolve.comp"
+    VERBATIM
+)
+list(APPEND GLASSLIGHT_SHADER_BINARIES "${resolve_group8_binary}")
+foreach(family RANGE 1 5)
+    set(trace_group128_binary
+        "${GLASSLIGHT_COMPILED_SHADER_DIR}/first_light.comp.group128.family${family}.spv")
+    add_custom_command(
+        OUTPUT "${trace_group128_binary}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GLASSLIGHT_COMPILED_SHADER_DIR}"
+        COMMAND Vulkan::glslangValidator -V --target-env vulkan1.2
+                -DGLASSLIGHT_TRACE_GROUP_SIZE=128 "-DGLASSLIGHT_FAMILY=${family}"
+                "-I${GLASSLIGHT_SHADER_DIR}" "${GLASSLIGHT_SHADER_DIR}/first_light.comp"
+                -o "${trace_group128_binary}"
+        DEPENDS "${GLASSLIGHT_SHADER_DIR}/first_light.comp"
+                "${GLASSLIGHT_SHADER_DIR}/geometry.glsl"
+        VERBATIM
+    )
+    list(APPEND GLASSLIGHT_SHADER_BINARIES "${trace_group128_binary}")
+
+    set(preview_group8_binary
+        "${GLASSLIGHT_COMPILED_SHADER_DIR}/glass_preview.comp.group8.family${family}.spv")
+    add_custom_command(
+        OUTPUT "${preview_group8_binary}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GLASSLIGHT_COMPILED_SHADER_DIR}"
+        COMMAND Vulkan::glslangValidator -V --target-env vulkan1.2
+                -DGLASSLIGHT_IMAGE_GROUP_SIZE=8 "-DGLASSLIGHT_FAMILY=${family}"
+                "-I${GLASSLIGHT_SHADER_DIR}" "${GLASSLIGHT_SHADER_DIR}/glass_preview.comp"
+                -o "${preview_group8_binary}"
+        DEPENDS "${GLASSLIGHT_SHADER_DIR}/glass_preview.comp"
+                "${GLASSLIGHT_SHADER_DIR}/geometry.glsl"
+        VERBATIM
+    )
+    list(APPEND GLASSLIGHT_SHADER_BINARIES "${preview_group8_binary}")
+endforeach()
+foreach(candidate IN ITEMS
+        "first_light.comp.group128.fracture.spv;GLASSLIGHT_TRACE_GROUP_SIZE=128"
+        "glass_preview.comp.group8.fracture.spv;GLASSLIGHT_IMAGE_GROUP_SIZE=8")
+    list(GET candidate 0 candidate_name)
+    list(GET candidate 1 candidate_define)
+    if(candidate_name MATCHES "^first_light")
+        set(candidate_source "${GLASSLIGHT_SHADER_DIR}/first_light.comp")
+    else()
+        set(candidate_source "${GLASSLIGHT_SHADER_DIR}/glass_preview.comp")
+    endif()
+    set(candidate_binary "${GLASSLIGHT_COMPILED_SHADER_DIR}/${candidate_name}")
+    add_custom_command(
+        OUTPUT "${candidate_binary}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GLASSLIGHT_COMPILED_SHADER_DIR}"
+        COMMAND Vulkan::glslangValidator -V --target-env vulkan1.2
+                "-D${candidate_define}" -DGLASSLIGHT_FRACTURE_SHADER=1
+                "-I${GLASSLIGHT_SHADER_DIR}" "${candidate_source}" -o "${candidate_binary}"
+        DEPENDS "${candidate_source}" "${GLASSLIGHT_SHADER_DIR}/geometry.glsl"
+        VERBATIM
+    )
+    list(APPEND GLASSLIGHT_SHADER_BINARIES "${candidate_binary}")
+endforeach()
 add_custom_target(glasslight-shaders DEPENDS ${GLASSLIGHT_SHADER_BINARIES})
 
 add_library(glasslight-platform STATIC
@@ -131,10 +217,13 @@ target_link_libraries(glasslight-core PUBLIC
 )
 
 add_library(glasslight-render STATIC
+    src/render/adaptive_controller.cpp
     src/render/vulkan_renderer.cpp
 )
 add_dependencies(glasslight-render glasslight-shaders)
 target_include_directories(glasslight-render PUBLIC src)
+target_include_directories(glasslight-render SYSTEM PRIVATE
+    ${vma_SOURCE_DIR}/include)
 target_compile_definitions(glasslight-render PRIVATE
     GLASSLIGHT_SHADER_DIR="${GLASSLIGHT_COMPILED_SHADER_DIR}"
 )
@@ -142,6 +231,7 @@ target_link_libraries(glasslight-render PUBLIC
     glasslight-core
     glasslight-platform
     Vulkan::Vulkan
+    GPUOpen::VulkanMemoryAllocator
     SDL3::SDL3-static
 )
 
@@ -220,6 +310,12 @@ else()
 endif()
 
 if(BUILD_TESTING)
+    add_executable(glasslight-adaptive-controller-tests
+        tests/adaptive_controller_tests.cpp)
+    target_link_libraries(glasslight-adaptive-controller-tests PRIVATE
+        glasslight-render)
+    add_test(NAME adaptive-controller COMMAND glasslight-adaptive-controller-tests)
+
     add_executable(glasslight-composition-tests tests/composition_tests.cpp)
     target_link_libraries(glasslight-composition-tests PRIVATE glasslight-core)
     add_test(NAME composition COMMAND glasslight-composition-tests)

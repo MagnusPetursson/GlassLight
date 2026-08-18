@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +15,7 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -558,6 +560,176 @@ int validateFamilies(glasslight::VulkanRenderer& renderer,
         std::cerr << "FAIL: " << message << '\n';
         ++failures;
     };
+    const auto waitFor = [&](const glasslight::RenderTicket ticket) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto result = renderer.poll(ticket);
+            if (result.state != glasslight::RenderPollState::Pending) return result;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        glasslight::RenderPollResult result;
+        result.state = glasslight::RenderPollState::Failed;
+        result.error = "asynchronous ticket did not complete within ten seconds";
+        return result;
+    };
+
+    // Exercise the public nonblocking lifecycle before structural cases:
+    // supersession, two-slot overlap, mapped readback lifetime, release/reuse,
+    // resize, invalid-ticket failure, and capability-selected memory classes.
+    glasslight::RenderRequest asyncRequest;
+    asyncRequest.settings.seed = 0xa51c000000000001ULL;
+    asyncRequest.settings.shapeFamily = glasslight::ShapeFamily::Pebble;
+    asyncRequest.settings.quality = glasslight::QualityPreset::Draft;
+    asyncRequest.width = 160;
+    asyncRequest.height = 90;
+    asyncRequest.samples = 32'768u;
+    std::string asyncError;
+    const auto firstTicket = renderer.submit(asyncRequest, asyncError);
+    asyncRequest.settings.phase = 0.25f;
+    const auto secondTicket = renderer.submit(asyncRequest, asyncError);
+    if (!firstTicket || !secondTicket) {
+        fail("two-slot asynchronous submission failed: " + asyncError);
+    } else {
+        const auto firstPoll = renderer.poll(firstTicket);
+        if (firstPoll.state != glasslight::RenderPollState::Superseded) {
+            fail("older asynchronous request was not coalesced as superseded");
+        }
+        renderer.release(firstTicket);
+        const auto secondPoll = waitFor(secondTicket);
+        if (secondPoll.state != glasslight::RenderPollState::Ready ||
+            !secondPoll.frame || secondPoll.frame.width != 160u ||
+            secondPoll.frame.height != 90u ||
+            secondPoll.stats.tracedSamples != asyncRequest.samples) {
+            fail("newest asynchronous request did not produce a valid mapped frame: " +
+                 secondPoll.error);
+        }
+        renderer.release(secondTicket);
+    }
+    asyncRequest.width = 192;
+    asyncRequest.height = 108;
+    const auto resizedTicket = renderer.submit(asyncRequest, asyncError);
+    if (!resizedTicket) {
+        fail("asynchronous resize/slot reuse failed: " + asyncError);
+    } else {
+        const auto resizedPoll = waitFor(resizedTicket);
+        if (resizedPoll.state != glasslight::RenderPollState::Ready ||
+            resizedPoll.frame.width != 192u || resizedPoll.frame.height != 108u) {
+            fail("resized asynchronous readback has the wrong extent");
+        }
+        renderer.release(resizedTicket);
+    }
+    if (renderer.poll({99u, 1u}).state != glasslight::RenderPollState::Failed) {
+        fail("invalid asynchronous tickets do not fail safely");
+    }
+    glasslight::RenderRequest progressive = asyncRequest;
+    progressive.width = 160;
+    progressive.height = 90;
+    progressive.samples = 32'768u;
+    progressive.resolveSamples = progressive.samples;
+    progressive.slotAffinity = 0u;
+    const auto progressiveFirst = renderer.submit(progressive, asyncError);
+    auto progressivePoll = progressiveFirst ? waitFor(progressiveFirst) :
+        glasslight::RenderPollResult{};
+    if (!progressiveFirst || progressivePoll.state != glasslight::RenderPollState::Ready) {
+        fail("first progressive pass failed: " + asyncError);
+    } else {
+        renderer.release(progressiveFirst);
+        progressive.sampleOffset = progressive.samples;
+        progressive.resolveSamples = progressive.samples * 2u;
+        progressive.progressivePass = 1u;
+        progressive.preserveAccumulation = true;
+        const auto progressiveSecond = renderer.submit(progressive, asyncError);
+        progressivePoll = progressiveSecond ? waitFor(progressiveSecond) :
+            glasslight::RenderPollResult{};
+        if (!progressiveSecond ||
+            progressivePoll.state != glasslight::RenderPollState::Ready) {
+            fail("second progressive pass failed: " + asyncError);
+        } else {
+            std::vector<std::uint32_t> progressivePixels(
+                progressivePoll.frame.rgba8,
+                progressivePoll.frame.rgba8 + static_cast<std::size_t>(
+                    progressivePoll.frame.width) * progressivePoll.frame.height);
+            renderer.release(progressiveSecond);
+            glasslight::RenderRequest exact = progressive;
+            exact.samples = progressive.resolveSamples;
+            exact.resolveSamples = 0u;
+            exact.sampleOffset = 0u;
+            exact.progressivePass = 0u;
+            exact.preserveAccumulation = false;
+            glasslight::RenderedImage exactImage;
+            glasslight::RenderStats exactStats;
+            if (!renderer.render(exact, exactImage, exactStats, asyncError) ||
+                exactImage.rgba8 != progressivePixels) {
+                fail("progressive accumulation differs from the exact seeded render");
+            }
+        }
+    }
+    const auto diagnostics = renderer.diagnostics();
+    if (!diagnostics.accumulation.deviceLocal ||
+        !diagnostics.settings.deviceLocal || !diagnostics.upload.hostVisible ||
+        !diagnostics.readback.hostVisible) {
+        fail("VMA did not select device-local working and host-visible staging memory");
+    }
+    if (diagnostics.settingsPayloadBytes != 624u) {
+        fail("legacy renders did not use the compact precomputed settings layout");
+    }
+    for (const glasslight::ShapeFamily candidateFamily : {
+             glasslight::ShapeFamily::Pebble, glasslight::ShapeFamily::Fracture}) {
+        glasslight::RenderRequest selectedGroups = asyncRequest;
+        selectedGroups.settings.shapeFamily = candidateFamily;
+        selectedGroups.settings.fractureShardCount = 3u;
+        selectedGroups.width = 128u;
+        selectedGroups.height = 72u;
+        selectedGroups.samples = 16'384u;
+        glasslight::RenderedImage alternateImage;
+        glasslight::RenderStats candidateStats;
+        selectedGroups.traceGroupSize = 128u;
+        selectedGroups.imageGroupSize = 8u;
+        if (!renderer.render(selectedGroups, alternateImage, candidateStats, asyncError)) {
+            fail("alternate workgroup wall render failed: " + asyncError);
+            continue;
+        }
+        std::string candidateReason;
+        if (!structurallyUseful(alternateImage, candidateStats,
+                                analyze(alternateImage), candidateReason)) {
+            fail("alternate workgroup wall output was structurally empty for " +
+                 familySlug(candidateFamily) + ": " + candidateReason);
+        }
+        glasslight::GlassPreviewRequest selectedPreview;
+        selectedPreview.settings = selectedGroups.settings;
+        selectedPreview.width = 96u;
+        selectedPreview.height = 96u;
+        glasslight::RenderedImage alternatePreviewImage;
+        glasslight::GlassPreviewStats candidatePreviewStats;
+        selectedPreview.imageGroupSize = 8u;
+        if (!renderer.renderGlassPreview(selectedPreview, alternatePreviewImage,
+                                         candidatePreviewStats, asyncError)) {
+            fail("alternate preview workgroup render failed: " + asyncError);
+        } else if (!previewStructurallyUseful(
+                       alternatePreviewImage, candidatePreviewStats,
+                       analyze(alternatePreviewImage), candidateReason)) {
+            fail("alternate preview workgroup output was structurally empty for " +
+                 familySlug(candidateFamily) + ": " + candidateReason);
+        }
+    }
+    glasslight::RenderRequest allocationProbe = asyncRequest;
+    allocationProbe.width = 640u;
+    allocationProbe.height = 360u;
+    allocationProbe.samples = 256u;
+    const auto allocationTicket = renderer.submit(allocationProbe, asyncError);
+    const auto allocationPoll = allocationTicket ? waitFor(allocationTicket) :
+        glasslight::RenderPollResult{};
+    if (!allocationTicket || allocationPoll.state != glasslight::RenderPollState::Ready) {
+        fail("transient allocation growth probe failed: " + asyncError);
+    } else {
+        renderer.release(allocationTicket);
+        const std::uint64_t grownBytes = renderer.diagnostics().transientAllocationBytes;
+        renderer.trimTransientResources();
+        const std::uint64_t trimmedBytes = renderer.diagnostics().transientAllocationBytes;
+        if (trimmedBytes >= grownBytes || trimmedBytes > 32u * 1024u) {
+            fail("transient render allocations did not return to their bounded idle size");
+        }
+    }
 
     // Pick an Auto seed that resolves to one of the 0.2 families, ensuring the
     // core selection and renderer dispatch stay in lock-step as the enum grows.

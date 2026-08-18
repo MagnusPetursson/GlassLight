@@ -1,7 +1,11 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 
-layout(local_size_x = 16, local_size_y = 16) in;
+#ifndef GLASSLIGHT_IMAGE_GROUP_SIZE
+#define GLASSLIGHT_IMAGE_GROUP_SIZE 16
+#endif
+layout(local_size_x = GLASSLIGHT_IMAGE_GROUP_SIZE,
+       local_size_y = GLASSLIGHT_IMAGE_GROUP_SIZE) in;
 
 layout(set = 0, binding = 1, std430) writeonly buffer OutputPixels {
     uint pixels[];
@@ -41,8 +45,12 @@ layout(set = 0, binding = 3, std430) readonly buffer Settings {
 #ifdef GLASSLIGHT_FRACTURE_SHADER
     uvec4 fractureInfo;
     vec4 fractureBounds;
+    vec4 fractureGroupBounds[4];
     FractureShardGpu fractureShards[16];
     FracturePlaneSetGpu fracturePlanes[16];
+#else
+    vec4 legacyShape[4];
+    vec4 legacyCells[24]; // local position.xyz, uintBitsToFloat(tint index)
 #endif
 } settings;
 
@@ -52,7 +60,7 @@ layout(push_constant) uniform PreviewPush {
     uint width;
     uint height;
     uint edgeOverlay;
-    uint padding;
+    uint interactive;
     float orbitYaw;
     float orbitPitch;
     float zoom;
@@ -65,18 +73,10 @@ bool previewMarch(vec3 origin, vec3 direction, float maximumDistance,
     return glassFractureNextInterface(origin, direction, maximumDistance,
                                       hit, traveled, hitNormal);
 #else
-    traveled = 0.0;
-    for (int step = 0; step < 192; ++step) {
-        hit = origin + direction * traveled;
-        float d = abs(glassSdf(hit));
-        if (d < 0.0011 && traveled > 0.0005) {
-            hitNormal = glassNormal(hit);
-            return true;
-        }
-        traveled += max(d * 0.55, 0.0014);
-        if (traveled >= maximumDistance) return false;
-    }
-    return false;
+    int maximumSteps = pc.interactive != 0u ? 72 : 192;
+    return glassLegacyNextInterface(origin, direction, maximumDistance,
+                                    maximumSteps, 0.0011, 0.55, 0.0014,
+                                    hit, traveled, hitNormal);
 #endif
 }
 
@@ -103,9 +103,9 @@ vec3 previewGlass(vec3 origin, vec3 direction, vec3 firstHit, vec3 firstNormal) 
     vec3 interfaceNormal = firstNormal;
 
 #ifdef GLASSLIGHT_FRACTURE_SHADER
-    const int maximumInterfaces = 16;
+    int maximumInterfaces = pc.interactive != 0u ? 6 : 16;
 #else
-    const int maximumInterfaces = 8;
+    int maximumInterfaces = pc.interactive != 0u ? 4 : 8;
 #endif
     for (int interfaceIndex = 0; interfaceIndex < maximumInterfaces; ++interfaceIndex) {
         if (interfaceIndex >= maximumInterfaces) break;
@@ -114,7 +114,7 @@ vec3 previewGlass(vec3 origin, vec3 direction, vec3 firstHit, vec3 firstNormal) 
         vec3 orientedNormal = entering ? outwardNormal : -outwardNormal;
         float eta = entering ? 1.0 / ior : ior;
         float cosine = clamp(-dot(direction, orientedNormal), 0.0, 1.0);
-        float f0 = pow((ior - 1.0) / (ior + 1.0), 2.0);
+        float f0 = uintBitsToFloat(settings.renderOptions.z);
         float fresnel = f0 + (1.0 - f0) * pow(1.0 - cosine, 5.0);
         radiance += throughput * fresnel * studioEnvironment(reflect(direction, orientedNormal));
 

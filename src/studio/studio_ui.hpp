@@ -13,8 +13,13 @@ struct StudioDiagnostics {
     std::string gpuName;
     std::string statusMessage;
     std::string warningMessage;
-    double renderMilliseconds = 0.0;
+    std::string performanceMessage;
+    double gpuStageMilliseconds = 0.0;
+    double endToEndMilliseconds = 0.0;
+    double deliveredFps = 0.0;
+    double p95FrameMilliseconds = 0.0;
     std::uint64_t accumulatedPhotons = 0;
+    std::string qualityCeiling;
     float accumulationProgress = 0.0f;
     float hitRate = 0.0f;
     bool exportInProgress = false;

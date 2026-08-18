@@ -74,6 +74,7 @@ glasslight                         Open the native studio
 glasslight --version
 glasslight --render-still FILE [SEED] SHAPE
 glasslight --smoke-test DIRECTORY
+glasslight --benchmark DIRECTORY
 glasslight --video-smoke FILE
 glasslight --list-gpus
 glasslight --gpu-info
@@ -94,8 +95,11 @@ GLASSLIGHT_GPU="AMD Radeon 860M Graphics (RADV GFX1152)" \
     ./build/dev-linux/glasslight --gpu-info
 ```
 
-The selected Quality preset fixes the photon and interface budget. Slower
-devices may update less often instead of silently reducing optical quality.
+The selected Quality preset is the interactive ceiling and remains the exact
+still/video export setting. Live rendering starts at Draft, uses measured GPU,
+readback, and SDL-upload time to target 30 fps, then progressively restores the
+selected ceiling after 250 ms without input. It never uses GPU vendor/name
+branches or falls below Draft density and interface depth.
 
 ## Tests and renderer validation
 
@@ -108,6 +112,10 @@ ctest --preset dev-linux
 The suite covers composition validation and migration, persistent session
 state, PNG metadata, studio state, and the FFmpeg argument and process
 contract. The video tests exercise FFmpeg when it is available.
+
+Set `GLASSLIGHT_VULKAN_VALIDATION=1` for GPU validation runs. Initialization
+fails with exit code 2 if `VK_LAYER_KHRONOS_validation` is unavailable rather
+than silently skipping the requested layer.
 
 GPU checks are intentionally separate from CTest so headless builders without
 Vulkan remain usable. Build and run the validation executable explicitly:
@@ -135,6 +143,25 @@ tracked or external output paths. Use `GLASSLIGHT_GPU` to render the same seeds
 on another compatible device.
 
 ## Performance and Fracture review
+
+The packaged benchmark records allocation properties, timestamp support,
+fixed and adaptive stage timings, delivered fps, exact preview/video/still
+workloads, and an aesthetic contact sheet:
+
+```sh
+GLASSLIGHT_GPU="AMD Radeon 860M Graphics (RADV GFX1152)" \
+    ./build/release-linux/glasslight \
+    --benchmark build/radeon-adaptive-benchmark
+```
+
+`system.json`, `benchmark.tsv`, and `contact-sheet.png` are written to the
+selected directory. Exit code 1 means the adaptive 28 fps / 33.3 ms median /
+40 ms P95 / 100 ms stall gate failed; exit code 2 means the runtime or command
+was unavailable. The report also measures the packaged 128/256-thread trace
+and 8x8/16x16 resolve/preview candidates. Production remains on one
+capability-neutral 256/16 profile on every GPU; change that selection only
+after comparing the same report on both release-reference machines, never by
+matching a device or vendor name.
 
 Run performance gates on the target physical GPU, not a software Vulkan
 device. The benchmark warms persistent pipelines, then renders every family at

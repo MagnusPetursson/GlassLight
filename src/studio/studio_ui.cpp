@@ -550,9 +550,14 @@ void StudioUi::drawInspector(const StudioFrame& frame, StudioActions& actions) {
         if (ImGui::CollapsingHeader("Diagnostics")) {
             ImGui::TextWrapped("GPU: %s", frame.diagnostics.gpuName.empty() ?
                                "Not initialized" : frame.diagnostics.gpuName.c_str());
-            ImGui::Text("Render: %.2f ms", frame.diagnostics.renderMilliseconds);
-            ImGui::Text("Photons: %llu",
-                        static_cast<unsigned long long>(frame.diagnostics.accumulatedPhotons));
+            ImGui::Text("GPU stages: %.2f ms", frame.diagnostics.gpuStageMilliseconds);
+            ImGui::Text("End to end: %.2f ms", frame.diagnostics.endToEndMilliseconds);
+            ImGui::Text("Delivered: %.1f fps  P95 %.1f ms",
+                        frame.diagnostics.deliveredFps,
+                        frame.diagnostics.p95FrameMilliseconds);
+            ImGui::Text("Photons: %llu  Ceiling: %s",
+                        static_cast<unsigned long long>(frame.diagnostics.accumulatedPhotons),
+                        frame.diagnostics.qualityCeiling.c_str());
             ImGui::Text("Hit rate: %.1f%%", frame.diagnostics.hitRate * 100.0f);
             ImGui::ProgressBar(std::clamp(frame.diagnostics.accumulationProgress, 0.0f, 1.0f),
                                ImVec2(-1.0f, 0.0f));
@@ -567,6 +572,11 @@ void StudioUi::drawInspector(const StudioFrame& frame, StudioActions& actions) {
     if (!frame.diagnostics.warningMessage.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.97f, 0.53f, 0.40f, 1.0f));
         ImGui::TextWrapped("%s", frame.diagnostics.warningMessage.c_str());
+        ImGui::PopStyleColor();
+    }
+    if (!frame.diagnostics.performanceMessage.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.97f, 0.69f, 0.31f, 1.0f));
+        ImGui::TextWrapped("%s", frame.diagnostics.performanceMessage.c_str());
         ImGui::PopStyleColor();
     }
     if (!frame.diagnostics.statusMessage.empty()) {

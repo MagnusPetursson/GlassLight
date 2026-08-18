@@ -4,10 +4,13 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -122,17 +125,37 @@ int main() {
         tiny.frameCount = 2;
         tiny.settingsJson = R"({"schemaVersion":1,"seed":7})";
         std::uint32_t completed = 0;
+        std::mutex overlapMutex;
+        std::condition_variable overlapCondition;
+        bool secondStarted = false;
+        bool allowSecondToFinish = false;
+        bool overlapObserved = false;
         error.clear();
         expect(glasslight::media::exportMp4(
                    tiny,
-                   [](std::uint32_t index, std::vector<std::uint8_t>& rgba,
-                      std::string&) {
+                   [&](std::uint32_t index, std::vector<std::uint8_t>& rgba,
+                       std::string&) {
+                       if (index == 1u) {
+                           std::unique_lock lock(overlapMutex);
+                           secondStarted = true;
+                           overlapCondition.notify_all();
+                           overlapCondition.wait_for(lock, std::chrono::seconds(2),
+                               [&] { return allowSecondToFinish; });
+                       }
                        rgba.assign(16u, 255u);
                        rgba[index == 0u ? 1u : 2u] = 32u;
                        return true;
                    },
                    {[&](const glasslight::media::VideoExportProgress& progress) {
                         completed = progress.completedFrames;
+                        if (progress.completedFrames == 1u) {
+                            std::unique_lock lock(overlapMutex);
+                            overlapObserved = overlapCondition.wait_for(
+                                lock, std::chrono::seconds(2),
+                                [&] { return secondStarted; });
+                            allowSecondToFinish = true;
+                            overlapCondition.notify_all();
+                        }
                     }, {}},
                    error),
                "tiny MP4 should export through FFmpeg: " + error);
@@ -140,6 +163,45 @@ int main() {
         expect(std::filesystem::file_size(tiny.outputPath, fileError) > 0u && !fileError,
                "tiny MP4 should be nonempty");
         expect(completed == tiny.frameCount, "progress should report every encoded frame");
+        expect(overlapObserved,
+               "frame N+1 should begin before frame N FFmpeg handoff completes");
+
+        VideoExportConfig cancelled = tiny;
+        cancelled.outputPath = outputDirectory / "cancelled.mp4";
+        cancelled.frameCount = 3u;
+        std::atomic<bool> cancelRequested{false};
+        bool cancelledProviderCalled = false;
+        error.clear();
+        expect(!glasslight::media::exportMp4(
+                   cancelled,
+                   [&](std::uint32_t, std::vector<std::uint8_t>& rgba, std::string&) {
+                       cancelledProviderCalled = true;
+                       rgba.assign(16u, 64u);
+                       return true;
+                   },
+                   {[&](const glasslight::media::VideoExportProgress& progress) {
+                        if (progress.completedFrames == 1u) cancelRequested.store(true);
+                    }, [&] { return cancelRequested.load(); }},
+                   error),
+               "cancelled MP4 should stop without publishing output");
+        expect(cancelledProviderCalled, "cancellation test should render its first frame");
+        expect(error == "Video export cancelled.",
+               "cancelled MP4 should return the cancellation reason");
+        expect(!std::filesystem::exists(cancelled.outputPath),
+               "cancelled MP4 should not publish a partial output");
+
+        bool immediateProviderCalled = false;
+        error.clear();
+        expect(!glasslight::media::exportMp4(
+                   cancelled,
+                   [&](std::uint32_t, std::vector<std::uint8_t>&, std::string&) {
+                       immediateProviderCalled = true;
+                       return true;
+                   },
+                   {{}, [] { return true; }}, error),
+               "pre-cancelled MP4 should return immediately");
+        expect(!immediateProviderCalled,
+               "pre-cancelled MP4 should not allocate or render export frames");
         error.clear();
         expect(glasslight::media::exportMp4(
                    tiny,

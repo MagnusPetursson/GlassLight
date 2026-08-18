@@ -26,6 +26,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <thread>
@@ -107,16 +108,20 @@ std::filesystem::path ensureExtension(std::filesystem::path path,
     return path;
 }
 
-bool uploadTexture(SDL_Renderer* renderer, SDL_Texture*& texture,
-                   const glasslight::RenderedImage& image, std::string& error) {
+bool uploadTexturePixels(SDL_Renderer* renderer, SDL_Texture*& texture,
+                         const std::uint32_t* pixels,
+                         const std::uint32_t width,
+                         const std::uint32_t height,
+                         const std::size_t pitchBytes,
+                         std::string& error) {
     if (texture) {
         float existingWidth = 0.0f;
         float existingHeight = 0.0f;
         if (SDL_GetTextureSize(texture, &existingWidth, &existingHeight) &&
-            static_cast<std::uint32_t>(existingWidth) == image.width &&
-            static_cast<std::uint32_t>(existingHeight) == image.height) {
-            if (SDL_UpdateTexture(texture, nullptr, image.rgba8.data(),
-                                  static_cast<int>(image.width * sizeof(std::uint32_t)))) {
+            static_cast<std::uint32_t>(existingWidth) == width &&
+            static_cast<std::uint32_t>(existingHeight) == height) {
+            if (SDL_UpdateTexture(texture, nullptr, pixels,
+                                  static_cast<int>(pitchBytes))) {
                 return true;
             }
             error = "Could not update preview texture: " + std::string(SDL_GetError());
@@ -125,13 +130,13 @@ bool uploadTexture(SDL_Renderer* renderer, SDL_Texture*& texture,
     }
     SDL_Texture* replacement = SDL_CreateTexture(
         renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING,
-        static_cast<int>(image.width), static_cast<int>(image.height));
+        static_cast<int>(width), static_cast<int>(height));
     if (!replacement) {
         error = "Could not create preview texture: " + std::string(SDL_GetError());
         return false;
     }
-    if (!SDL_UpdateTexture(replacement, nullptr, image.rgba8.data(),
-                           static_cast<int>(image.width * sizeof(std::uint32_t)))) {
+    if (!SDL_UpdateTexture(replacement, nullptr, pixels,
+                           static_cast<int>(pitchBytes))) {
         error = "Could not upload preview texture: " + std::string(SDL_GetError());
         SDL_DestroyTexture(replacement);
         return false;
@@ -141,6 +146,18 @@ bool uploadTexture(SDL_Renderer* renderer, SDL_Texture*& texture,
     }
     texture = replacement;
     return true;
+}
+
+bool uploadTexture(SDL_Renderer* renderer, SDL_Texture*& texture,
+                   const glasslight::RenderedImage& image, std::string& error) {
+    return uploadTexturePixels(renderer, texture, image.rgba8.data(),
+        image.width, image.height, image.width * sizeof(std::uint32_t), error);
+}
+
+bool uploadTexture(SDL_Renderer* renderer, SDL_Texture*& texture,
+                   const glasslight::ReadbackFrameView& frame, std::string& error) {
+    return uploadTexturePixels(renderer, texture, frame.rgba8,
+        frame.width, frame.height, frame.pitchBytes, error);
 }
 
 void drawFullscreenArtwork(SDL_Renderer* renderer, SDL_Texture* texture,
@@ -404,6 +421,387 @@ int runVideoSmoke(const std::filesystem::path& outputPath) {
     return 0;
 }
 
+double percentile(std::vector<double> values, const double fraction) {
+    if (values.empty()) return 0.0;
+    std::sort(values.begin(), values.end());
+    const std::size_t index = static_cast<std::size_t>(std::ceil(
+        fraction * static_cast<double>(values.size()))) - 1u;
+    return values[std::min(index, values.size() - 1u)];
+}
+
+bool waitForTicket(glasslight::VulkanRenderer& renderer,
+                   const glasslight::RenderTicket ticket,
+                   glasslight::RenderPollResult& result,
+                   std::string& error) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+    do {
+        result = renderer.poll(ticket);
+        if (result.state == glasslight::RenderPollState::Ready) return true;
+        if (result.state == glasslight::RenderPollState::Failed) {
+            error = result.error;
+            return false;
+        }
+        if (result.state == glasslight::RenderPollState::Superseded) {
+            error = "Benchmark request was unexpectedly superseded.";
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+    error = "Benchmark request timed out after five minutes.";
+    return false;
+}
+
+nlohmann::json allocationJson(const glasslight::MemoryAllocationDiagnostics& memory) {
+    return {{"memory_type", memory.memoryTypeIndex},
+            {"device_local", memory.deviceLocal},
+            {"host_visible", memory.hostVisible},
+            {"host_cached", memory.hostCached},
+            {"host_coherent", memory.hostCoherent}};
+}
+
+int runBenchmark(const std::filesystem::path& outputDirectory) {
+    std::error_code filesystemError;
+    std::filesystem::create_directories(outputDirectory, filesystemError);
+    if (filesystemError) {
+        std::cerr << "Could not create benchmark directory: "
+                  << filesystemError.message() << '\n';
+        return 2;
+    }
+    struct BenchmarkPresentation {
+        SDL_Window* window = nullptr;
+        SDL_Renderer* renderer = nullptr;
+        SDL_Texture* texture = nullptr;
+        ~BenchmarkPresentation() {
+            if (texture) SDL_DestroyTexture(texture);
+            if (renderer) SDL_DestroyRenderer(renderer);
+            if (window) SDL_DestroyWindow(window);
+            SDL_Quit();
+        }
+    } presentation;
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
+        std::cerr << "Could not initialize SDL for benchmark upload timing: "
+                  << SDL_GetError() << '\n';
+        return 2;
+    }
+    presentation.window = SDL_CreateWindow(
+        "GlassLight benchmark", 64, 64, SDL_WINDOW_HIDDEN);
+    presentation.renderer = presentation.window
+        ? SDL_CreateRenderer(presentation.window, nullptr) : nullptr;
+    if (!presentation.window || !presentation.renderer) {
+        std::cerr << "Could not create the SDL benchmark presentation path: "
+                  << SDL_GetError() << '\n';
+        return 2;
+    }
+
+    glasslight::VulkanRenderer renderer;
+    std::string error;
+    if (!renderer.initialize(preferredGpuName(), error)) {
+        std::cerr << error << '\n';
+        return 2;
+    }
+
+    // Force representative allocations before recording their selected heaps.
+    glasslight::CompositionSettings settings;
+    settings.seed = 0x42454e43484d4152ULL;
+    settings.shapeFamily = glasslight::ShapeFamily::Pebble;
+    settings.quality = glasslight::QualityPreset::Standard;
+    glasslight::RenderRequest warm;
+    warm.settings = settings;
+    warm.width = kPreviewWidth;
+    warm.height = kPreviewHeight;
+    warm.samples = static_cast<std::uint32_t>(std::llround(
+        glasslight::photonsPerMegapixel(settings.quality) *
+        static_cast<double>(warm.width) * warm.height / 1'000'000.0));
+    glasslight::RenderTicket warmTicket = renderer.submit(warm, error);
+    glasslight::RenderPollResult warmResult;
+    if (!warmTicket || !waitForTicket(renderer, warmTicket, warmResult, error)) {
+        if (warmTicket) renderer.release(warmTicket);
+        std::cerr << "Benchmark warm-up failed: " << error << '\n';
+        return 2;
+    }
+    renderer.release(warmTicket);
+
+    const auto diagnostics = renderer.diagnostics();
+    nlohmann::json system{
+        {"version", GLASSLIGHT_VERSION},
+        {"os", SDL_GetPlatform()},
+        {"gpu", diagnostics.deviceName},
+        {"driver", diagnostics.driverName},
+        {"driver_version", diagnostics.driverVersion},
+        {"timestamp_support", diagnostics.timestampAvailable},
+        {"timestamp_period_ns", diagnostics.timestampPeriodNanoseconds},
+        {"transientAllocationBytes", diagnostics.transientAllocationBytes},
+        {"settingsPayloadBytes", diagnostics.settingsPayloadBytes}};
+    system["allocations"] = {
+        {"accumulation", allocationJson(diagnostics.accumulation)},
+        {"settings", allocationJson(diagnostics.settings)},
+        {"upload", allocationJson(diagnostics.upload)},
+        {"readback", allocationJson(diagnostics.readback)}};
+    system["workgroups"] = {
+        {"selected_trace", 256}, {"selected_image", 16},
+        {"trace_candidates", {128, 256}}, {"image_candidates", {8, 16}}};
+    std::ofstream systemFile(outputDirectory / "system.json", std::ios::trunc);
+    std::ofstream report(outputDirectory / "benchmark.tsv", std::ios::trunc);
+    if (!systemFile || !report) {
+        std::cerr << "Could not create benchmark reports.\n";
+        return 2;
+    }
+    systemFile << system.dump(2) << '\n';
+    report << "workload\tmode\twidth\theight\tphotons\tmedian_trace_ms"
+              "\tmedian_resolve_ms\tmedian_transfer_ms\tmedian_sdl_upload_ms"
+              "\tmedian_e2e_ms"
+              "\tp95_e2e_ms\tmax_interval_ms\tdelivered_fps"
+              "\tfloor\tceiling\tpass_state\n";
+
+    std::vector<double> traceTimes;
+    std::vector<double> resolveTimes;
+    std::vector<double> transferTimes;
+    std::vector<double> sdlUploadTimes;
+    std::vector<double> endToEndTimes;
+    const auto record = [&](const glasslight::RenderPollResult& value) {
+        traceTimes.push_back(value.timings.traceMilliseconds);
+        resolveTimes.push_back(value.timings.resolveMilliseconds);
+        transferTimes.push_back(value.timings.transferMilliseconds);
+        sdlUploadTimes.push_back(value.timings.sdlUploadMilliseconds);
+        endToEndTimes.push_back(value.timings.submitToReadyMilliseconds +
+                                value.timings.sdlUploadMilliseconds);
+    };
+    for (int index = 0; index < 5; ++index) {
+        warm.settings.phase = static_cast<float>(index) / 5.0f;
+        const auto ticket = renderer.submit(warm, error);
+        glasslight::RenderPollResult result;
+        if (!ticket || !waitForTicket(renderer, ticket, result, error)) {
+            if (ticket) renderer.release(ticket);
+            std::cerr << "Fixed benchmark failed: " << error << '\n';
+            return 2;
+        }
+        record(result);
+        renderer.release(ticket);
+    }
+    report << "wall-standard\tfixed\t1280\t720\t" << warm.samples << '\t'
+           << percentile(traceTimes, 0.5) << '\t' << percentile(resolveTimes, 0.5) << '\t'
+           << percentile(transferTimes, 0.5) << '\t'
+           << percentile(sdlUploadTimes, 0.5) << '\t'
+           << percentile(endToEndTimes, 0.5) << '\t' << percentile(endToEndTimes, 0.95)
+           << "\t0\t0\t" << warm.samples << '\t' << warm.samples << "\tmeasured\n";
+
+    const auto benchmarkWallCandidate = [&](const char* name,
+                                            const std::uint32_t traceGroup,
+                                            const std::uint32_t imageGroup) {
+        traceTimes.clear(); resolveTimes.clear(); transferTimes.clear();
+        endToEndTimes.clear(); sdlUploadTimes.clear();
+        for (int index = 0; index < 3; ++index) {
+            glasslight::RenderRequest candidate = warm;
+            candidate.traceGroupSize = traceGroup;
+            candidate.imageGroupSize = imageGroup;
+            candidate.settings.phase = static_cast<float>(index) / 3.0f;
+            const auto ticket = renderer.submit(candidate, error);
+            glasslight::RenderPollResult result;
+            if (!ticket || !waitForTicket(renderer, ticket, result, error)) {
+                if (ticket) renderer.release(ticket);
+                return false;
+            }
+            record(result);
+            renderer.release(ticket);
+        }
+        report << name << "\tworkgroup-candidate\t1280\t720\t" << warm.samples << '\t'
+               << percentile(traceTimes, 0.5) << '\t' << percentile(resolveTimes, 0.5)
+               << '\t' << percentile(transferTimes, 0.5) << "\t0\t"
+               << percentile(endToEndTimes, 0.5) << '\t'
+               << percentile(endToEndTimes, 0.95) << "\t0\t0\t"
+               << warm.samples << '\t' << warm.samples << "\tmeasured\n";
+        return true;
+    };
+    if (!benchmarkWallCandidate("trace-group-128", 128u, 16u) ||
+        !benchmarkWallCandidate("trace-group-256", 256u, 16u) ||
+        !benchmarkWallCandidate("resolve-group-8x8", 256u, 8u) ||
+        !benchmarkWallCandidate("resolve-group-16x16", 256u, 16u)) {
+        std::cerr << "Workgroup candidate benchmark failed: " << error << '\n';
+        return 2;
+    }
+    const auto benchmarkPreviewCandidate = [&](const char* name,
+                                               const std::uint32_t imageGroup) {
+        traceTimes.clear(); resolveTimes.clear(); transferTimes.clear();
+        endToEndTimes.clear(); sdlUploadTimes.clear();
+        for (int index = 0; index < 3; ++index) {
+            glasslight::GlassPreviewRequest candidate;
+            candidate.settings = settings;
+            candidate.width = 320u;
+            candidate.height = 180u;
+            candidate.orbitYaw += static_cast<float>(index) * 0.1f;
+            candidate.imageGroupSize = imageGroup;
+            const auto ticket = renderer.submitGlassPreview(candidate, error);
+            glasslight::RenderPollResult result;
+            if (!ticket || !waitForTicket(renderer, ticket, result, error)) {
+                if (ticket) renderer.release(ticket);
+                return false;
+            }
+            record(result);
+            renderer.release(ticket);
+        }
+        report << name << "\tworkgroup-candidate\t320\t180\t0\t"
+               << percentile(traceTimes, 0.5) << '\t' << percentile(resolveTimes, 0.5)
+               << '\t' << percentile(transferTimes, 0.5) << "\t0\t"
+               << percentile(endToEndTimes, 0.5) << '\t'
+               << percentile(endToEndTimes, 0.95)
+               << "\t0\t0\t0\t0\tmeasured\n";
+        return true;
+    };
+    if (!benchmarkPreviewCandidate("preview-group-8x8", 8u) ||
+        !benchmarkPreviewCandidate("preview-group-16x16", 16u)) {
+        std::cerr << "Preview workgroup candidate benchmark failed: " << error << '\n';
+        return 2;
+    }
+
+    glasslight::AdaptiveRenderController controller;
+    controller.reset(settings.quality, kPreviewWidth, kPreviewHeight, 0.0);
+    traceTimes.clear(); resolveTimes.clear(); transferTimes.clear();
+    sdlUploadTimes.clear(); endToEndTimes.clear();
+    std::vector<double> intervals;
+    const auto adaptiveStart = std::chrono::steady_clock::now();
+    auto previousCompletion = adaptiveStart;
+    int frameIndex = 0;
+    while (std::chrono::steady_clock::now() - adaptiveStart < std::chrono::seconds(4)) {
+        const double elapsed = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - adaptiveStart).count();
+        const auto workload = controller.workload(elapsed);
+        glasslight::RenderRequest request = warm;
+        request.settings.phase = std::fmod(static_cast<float>(frameIndex++) / 180.0f, 1.0f);
+        request.samples = workload.photons;
+        request.interactiveInterfaceDepth = workload.interfaceDepth;
+        const auto ticket = renderer.submit(request, error);
+        glasslight::RenderPollResult result;
+        if (!ticket || !waitForTicket(renderer, ticket, result, error)) {
+            if (ticket) renderer.release(ticket);
+            std::cerr << "Adaptive benchmark failed: " << error << '\n';
+            return 2;
+        }
+        const auto uploadStart = std::chrono::steady_clock::now();
+        if (!uploadTexture(presentation.renderer, presentation.texture,
+                           result.frame, error)) {
+            renderer.release(ticket);
+            std::cerr << "Adaptive SDL upload failed: " << error << '\n';
+            return 2;
+        }
+        result.timings.sdlUploadMilliseconds = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - uploadStart).count();
+        renderer.recordSdlUpload(ticket, result.timings.sdlUploadMilliseconds);
+        const auto completed = std::chrono::steady_clock::now();
+        result.timings.completedFrameIntervalMilliseconds =
+            std::chrono::duration<double, std::milli>(completed - previousCompletion).count();
+        previousCompletion = completed;
+        controller.update(result.timings, elapsed);
+        if (completed - adaptiveStart >= std::chrono::seconds(2)) {
+            record(result);
+            intervals.push_back(result.timings.completedFrameIntervalMilliseconds);
+        }
+        renderer.release(ticket);
+    }
+    const double measuredSeconds = std::accumulate(intervals.begin(), intervals.end(), 0.0) /
+                                   1000.0;
+    const double deliveredFps = measuredSeconds > 0.0
+        ? static_cast<double>(intervals.size()) / measuredSeconds : 0.0;
+    const double medianEndToEnd = percentile(endToEndTimes, 0.5);
+    const double p95EndToEnd = percentile(endToEndTimes, 0.95);
+    const double maximumStall = intervals.empty() ? 0.0 :
+        *std::max_element(intervals.begin(), intervals.end());
+    const bool adaptivePassed = deliveredFps >= 28.0 && medianEndToEnd <= 33.3 &&
+                                p95EndToEnd <= 40.0 && maximumStall <= 100.0;
+    const auto finalWorkload = controller.workload(4'000.0);
+    report << "live-rotation\tadaptive\t1280\t720\t" << finalWorkload.photons << '\t'
+           << percentile(traceTimes, 0.5) << '\t' << percentile(resolveTimes, 0.5) << '\t'
+           << percentile(transferTimes, 0.5) << '\t'
+           << percentile(sdlUploadTimes, 0.5) << '\t' << medianEndToEnd << '\t'
+           << p95EndToEnd << '\t' << maximumStall << '\t' << deliveredFps
+           << "\t460800\t" << warm.samples
+           << '\t' << (adaptivePassed ? "pass" : "fail") << '\n';
+
+    struct ExactWorkload { const char* name; std::uint32_t width; std::uint32_t height;
+                           glasslight::QualityPreset quality; bool preview; };
+    const std::array exactWorkloads{
+        ExactWorkload{"card-preview", 320u, 180u, glasslight::QualityPreset::Draft, true},
+        ExactWorkload{"lightbox-preview", 768u, 768u, glasslight::QualityPreset::Standard, true},
+        ExactWorkload{"video-frame", 1920u, 1080u, glasslight::QualityPreset::Standard, false},
+        ExactWorkload{"still-4k", 3840u, 2160u, glasslight::QualityPreset::Standard, false}};
+    for (const auto& exact : exactWorkloads) {
+        glasslight::RenderPollResult result;
+        std::uint32_t photons = 0;
+        glasslight::RenderTicket ticket;
+        if (exact.preview) {
+            glasslight::GlassPreviewRequest request;
+            request.settings = settings;
+            request.width = exact.width;
+            request.height = exact.height;
+            ticket = renderer.submitGlassPreview(request, error);
+        } else {
+            glasslight::RenderRequest request;
+            request.settings = settings;
+            request.settings.quality = exact.quality;
+            request.width = exact.width;
+            request.height = exact.height;
+            photons = static_cast<std::uint32_t>(std::llround(
+                glasslight::photonsPerMegapixel(exact.quality) *
+                static_cast<double>(exact.width) * exact.height / 1'000'000.0));
+            request.samples = photons;
+            request.exportRender = true;
+            ticket = renderer.submit(request, error);
+        }
+        if (!ticket || !waitForTicket(renderer, ticket, result, error)) {
+            if (ticket) renderer.release(ticket);
+            std::cerr << exact.name << " benchmark failed: " << error << '\n';
+            return 2;
+        }
+        report << exact.name << "\tfixed\t" << exact.width << '\t' << exact.height << '\t'
+               << photons << '\t' << result.timings.traceMilliseconds << '\t'
+               << result.timings.resolveMilliseconds << '\t'
+               << result.timings.transferMilliseconds << '\t'
+               << result.timings.sdlUploadMilliseconds << '\t'
+               << result.timings.submitToReadyMilliseconds << '\t'
+               << result.timings.submitToReadyMilliseconds << "\t0\t0\t" << photons << '\t'
+               << photons << "\tmeasured\n";
+        renderer.release(ticket);
+    }
+
+    renderer.trimTransientResources();
+    // A compact deterministic contact sheet keeps aesthetic review local to
+    // the benchmark package without imposing golden-pixel requirements.
+    constexpr std::uint32_t tileWidth = 320u;
+    constexpr std::uint32_t tileHeight = 180u;
+    glasslight::RenderedImage sheet;
+    sheet.width = tileWidth * 3u;
+    sheet.height = tileHeight * 2u;
+    sheet.rgba8.resize(static_cast<std::size_t>(sheet.width) * sheet.height);
+    for (std::uint32_t familyIndex = 0; familyIndex < 6u; ++familyIndex) {
+        glasslight::CompositionSettings familySettings = settings;
+        familySettings.shapeFamily = static_cast<glasslight::ShapeFamily>(familyIndex + 1u);
+        familySettings.seed += familyIndex * 0x10001u;
+        glasslight::RenderedImage tile;
+        glasslight::RenderStats tileStats;
+        if (!renderComposition(renderer, familySettings, tileWidth, tileHeight,
+                               1.0, tile, tileStats, error)) {
+            std::cerr << "Contact-sheet render failed: " << error << '\n';
+            return 2;
+        }
+        const std::uint32_t offsetX = (familyIndex % 3u) * tileWidth;
+        const std::uint32_t offsetY = (familyIndex / 3u) * tileHeight;
+        for (std::uint32_t row = 0; row < tileHeight; ++row) {
+            std::copy_n(tile.rgba8.begin() + static_cast<std::size_t>(row) * tileWidth,
+                        tileWidth,
+                        sheet.rgba8.begin() + static_cast<std::size_t>(offsetY + row) *
+                            sheet.width + offsetX);
+        }
+    }
+    sheet.nonBackgroundPixels = sheet.rgba8.size();
+    if (!glasslight::savePng(sheet, outputDirectory / "contact-sheet.png", error)) {
+        std::cerr << error << '\n';
+        return 2;
+    }
+    report.flush();
+    std::cout << "Wrote adaptive benchmark reports to " << outputDirectory
+              << " on " << renderer.gpuName() << ".\n";
+    return adaptivePassed ? 0 : 1;
+}
+
 int runStudio() {
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         std::cerr << "Could not initialize SDL: " << SDL_GetError() << '\n';
@@ -463,13 +861,123 @@ int runStudio() {
     bool renderPending = gpuReady && studio.runtime().generated;
     bool glassPreviewPending = renderPending;
     auto nextGlassPreview = std::chrono::steady_clock::now();
+    const auto studioClockStart = std::chrono::steady_clock::now();
+    const auto studioMilliseconds = [&] {
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - studioClockStart).count();
+    };
+    glasslight::AdaptiveRenderController adaptiveController;
+    adaptiveController.reset(studio.settings().quality,
+                             kPreviewWidth, kPreviewHeight, 0.0);
+    glasslight::InteractiveWorkload interactiveWorkload =
+        adaptiveController.workload(0.0);
+    glasslight::RenderTicket artworkTicket;
+    glasslight::RenderTicket glassPreviewTicket;
+    glasslight::RenderTimings latestTimings;
+    std::uint64_t refinementAccumulated = 0;
+    float refinementProgress = 0.0f;
+    std::uint32_t pendingArtworkSamples = 0;
+    bool pendingArtworkRefinement = false;
 
     while (running) {
         SDL_Event event;
+        bool userInteracted = false;
         while (SDL_PollEvent(&event)) {
             ImGui_ImplSDL3_ProcessEvent(&event);
             if (event.type == SDL_EVENT_QUIT) {
                 running = false;
+            } else if (event.type == SDL_EVENT_KEY_DOWN ||
+                       event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+                       event.type == SDL_EVENT_MOUSE_BUTTON_UP ||
+                       event.type == SDL_EVENT_MOUSE_MOTION ||
+                       event.type == SDL_EVENT_MOUSE_WHEEL) {
+                userInteracted = true;
+            }
+        }
+
+        const double nowMilliseconds = studioMilliseconds();
+        if (userInteracted) adaptiveController.noteInteraction(nowMilliseconds);
+
+        if (artworkTicket) {
+            glasslight::RenderPollResult result = artRenderer.poll(artworkTicket);
+            if (result.state == glasslight::RenderPollState::Ready) {
+                const auto uploadStart = std::chrono::steady_clock::now();
+                std::string error;
+                const bool uploaded = uploadTexture(
+                    presentationRenderer, artworkTexture, result.frame, error);
+                const double uploadMilliseconds = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - uploadStart).count();
+                artRenderer.recordSdlUpload(artworkTicket, uploadMilliseconds);
+                result.timings.sdlUploadMilliseconds = uploadMilliseconds;
+                latestTimings = result.timings;
+                renderStats = result.stats;
+                if (pendingArtworkRefinement) {
+                    refinementAccumulated += pendingArtworkSamples;
+                    const double ceiling = glasslight::photonsPerMegapixel(
+                        studio.settings().quality) *
+                        static_cast<double>(kPreviewWidth) * kPreviewHeight / 1'000'000.0;
+                    refinementProgress = std::clamp(static_cast<float>(
+                        static_cast<double>(refinementAccumulated) /
+                        std::max(ceiling, 1.0)), 0.0f, 1.0f);
+                } else {
+                    refinementAccumulated = 0;
+                    refinementProgress = 0.0f;
+                }
+                preview.width = result.frame.width;
+                preview.height = result.frame.height;
+                preview.renderMilliseconds = result.timings.traceMilliseconds +
+                    result.timings.resolveMilliseconds + result.timings.transferMilliseconds;
+                const float priorPreviewScale = interactiveWorkload.glassPreviewScale;
+                adaptiveController.update(result.timings, nowMilliseconds);
+                interactiveWorkload = adaptiveController.workload(nowMilliseconds);
+                if (interactiveWorkload.glassPreviewScale != priorPreviewScale) {
+                    glassPreviewPending = true;
+                }
+                if (uploaded) {
+                    status = studio.runtime().playing
+                        ? "Live — adaptive 30 fps stream" : "Paused — refining";
+                } else {
+                    warning = error;
+                }
+                artRenderer.release(artworkTicket);
+                artworkTicket = {};
+                if (studio.runtime().generated && !videoJob.active.load() &&
+                    !studio.wallRenderingPaused() &&
+                    (studio.runtime().playing || refinementProgress < 1.0f)) {
+                    renderPending = true;
+                }
+            } else if (result.state == glasslight::RenderPollState::Superseded) {
+                artRenderer.release(artworkTicket);
+                artworkTicket = {};
+            } else if (result.state == glasslight::RenderPollState::Failed) {
+                warning = result.error;
+                status = "Render failed";
+                artRenderer.release(artworkTicket);
+                artworkTicket = {};
+            }
+        }
+
+        if (glassPreviewTicket) {
+            glasslight::RenderPollResult result = artRenderer.poll(glassPreviewTicket);
+            if (result.state == glasslight::RenderPollState::Ready) {
+                std::string error;
+                if (!uploadTexture(presentationRenderer, glassPreviewTexture,
+                                   result.frame, error)) {
+                    warning = error;
+                }
+                glassPreview.width = result.frame.width;
+                glassPreview.height = result.frame.height;
+                glassPreviewStats.resolvedFamily = result.stats.resolvedFamily;
+                glassPreviewStats.shadedPixels = result.stats.depositedSamples;
+                artRenderer.release(glassPreviewTicket);
+                glassPreviewTicket = {};
+            } else if (result.state == glasslight::RenderPollState::Superseded) {
+                artRenderer.release(glassPreviewTicket);
+                glassPreviewTicket = {};
+            } else if (result.state == glasslight::RenderPollState::Failed) {
+                warning = result.error;
+                artRenderer.release(glassPreviewTicket);
+                glassPreviewTicket = {};
             }
         }
 
@@ -505,10 +1013,21 @@ int runStudio() {
         frame.diagnostics.gpuName = gpuReady ? artRenderer.gpuName() : "No Vulkan device";
         frame.diagnostics.statusMessage = status;
         frame.diagnostics.warningMessage = warning;
-        frame.diagnostics.renderMilliseconds = preview.renderMilliseconds;
-        frame.diagnostics.accumulatedPhotons = renderStats.tracedSamples;
+        frame.diagnostics.performanceMessage = interactiveWorkload.performanceNotice
+            ? "Interactive rendering is at its minimum workload and remains below the "
+              "30 fps target. Exports are unaffected."
+            : std::string{};
+        frame.diagnostics.gpuStageMilliseconds = latestTimings.traceMilliseconds +
+            latestTimings.resolveMilliseconds + latestTimings.transferMilliseconds;
+        frame.diagnostics.endToEndMilliseconds = latestTimings.submitToReadyMilliseconds +
+            latestTimings.sdlUploadMilliseconds;
+        frame.diagnostics.deliveredFps = interactiveWorkload.deliveredFps;
+        frame.diagnostics.p95FrameMilliseconds = interactiveWorkload.p95FrameMilliseconds;
+        frame.diagnostics.accumulatedPhotons = interactiveWorkload.photons;
+        frame.diagnostics.qualityCeiling =
+            glasslight::qualityPresetName(studio.settings().quality);
         frame.diagnostics.hitRate = static_cast<float>(renderStats.estimatedHitRate);
-        frame.diagnostics.accumulationProgress = artworkTexture ? 1.0f : 0.0f;
+        frame.diagnostics.accumulationProgress = refinementProgress;
         frame.diagnostics.exportInProgress = videoJob.active.load();
         const std::uint32_t exportTotal = videoJob.total.load();
         frame.diagnostics.exportProgress = exportTotal == 0 ? 0.0f :
@@ -517,6 +1036,16 @@ int runStudio() {
         const bool wasPlaying = studio.runtime().playing;
         const bool wallWasPaused = studio.wallRenderingPaused();
         const glasslight::StudioActions actions = studio.draw(frame);
+        if ((actions.generateRequested ||
+             (actions.compositionChanged && userInteracted)) &&
+            studio.runtime().generated) {
+            adaptiveController.reset(studio.settings().quality,
+                                     kPreviewWidth, kPreviewHeight,
+                                     nowMilliseconds);
+            interactiveWorkload = adaptiveController.workload(nowMilliseconds);
+            refinementAccumulated = 0;
+            refinementProgress = 0.0f;
+        }
         if (actions.fullscreenToggleRequested) {
             SDL_SetWindowFullscreen(window, studio.runtime().fullscreen);
         }
@@ -527,6 +1056,10 @@ int runStudio() {
             studio.runtime().generated && !videoJob.active.load() &&
             !studio.wallRenderingPaused()) {
             renderPending = true;
+            if (actions.resetAccumulation) {
+                refinementAccumulated = 0;
+                refinementProgress = 0.0f;
+            }
         }
         if ((actions.generateRequested || actions.compositionChanged ||
              actions.glassPreviewChanged) && studio.runtime().generated) {
@@ -537,6 +1070,10 @@ int runStudio() {
             renderPending = true;
         }
         if (wasPlaying != studio.runtime().playing && studio.runtime().generated) {
+            adaptiveController.setPaused(!studio.runtime().playing, nowMilliseconds);
+            interactiveWorkload = adaptiveController.workload(nowMilliseconds);
+            refinementAccumulated = 0;
+            refinementProgress = 0.0f;
             renderPending = true;
         }
         if (actions.persistRequested || actions.generateRequested) {
@@ -578,6 +1115,12 @@ int runStudio() {
                                               preview, error)) {
                                 studio.setSettings(restored, true);
                                 studio.mutableRuntime().playing = false;
+                                adaptiveController.reset(restored.quality,
+                                    kPreviewWidth, kPreviewHeight, nowMilliseconds);
+                                adaptiveController.setPaused(true, nowMilliseconds);
+                                interactiveWorkload = adaptiveController.workload(nowMilliseconds);
+                                refinementAccumulated = 0;
+                                refinementProgress = 0.0f;
                                 glassPreviewPending = true;
                                 status = "Restored " + glasslight::platform::pathToUtf8(
                                     result->selection->filename());
@@ -609,6 +1152,7 @@ int runStudio() {
                         warning = error;
                         status = "Still export failed";
                     }
+                    artRenderer.trimTransientResources();
                 } else if (result->purpose == DialogPurpose::SaveVideo) {
                     const std::filesystem::path destination =
                         ensureExtension(*result->selection, ".mp4");
@@ -670,6 +1214,7 @@ int runStudio() {
                                       }},
                                      {[&] { return videoJob.cancel.load(); }}},
                                     exportError);
+                                artRenderer.trimTransientResources();
                                 {
                                     std::scoped_lock lock(videoJob.resultMutex);
                                     videoJob.succeeded = succeeded;
@@ -687,50 +1232,79 @@ int runStudio() {
             }
         }
 
-        if (renderPending && gpuReady && !videoJob.active.load() &&
-            !studio.wallRenderingPaused()) {
-            std::string error;
-            if (renderComposition(artRenderer, studio.settings(), kPreviewWidth,
-                                  kPreviewHeight, 1.0, preview,
-                                  renderStats, error)) {
-                if (uploadTexture(presentationRenderer, artworkTexture, preview, error)) {
-                    status = studio.runtime().playing ? "Live — one-turn seamless loop" : "Paused";
-                    warning.clear();
-                } else {
-                    warning = error;
-                }
+        if (renderPending && !artworkTicket && gpuReady &&
+            !videoJob.active.load() && !studio.wallRenderingPaused()) {
+            interactiveWorkload = adaptiveController.workload(nowMilliseconds);
+            glasslight::RenderRequest request;
+            request.settings = studio.settings();
+            request.width = kPreviewWidth;
+            request.height = kPreviewHeight;
+            const bool accumulateRefinement = interactiveWorkload.refining &&
+                (!studio.runtime().playing ||
+                 std::abs(studio.settings().rotationRpm) < 1.0e-6f);
+            const std::uint64_t ceilingSamples = static_cast<std::uint64_t>(std::llround(
+                glasslight::photonsPerMegapixel(studio.settings().quality) *
+                static_cast<double>(kPreviewWidth) * kPreviewHeight / 1'000'000.0));
+            const std::uint64_t remaining = ceilingSamples > refinementAccumulated
+                ? ceilingSamples - refinementAccumulated : 0u;
+            if (accumulateRefinement && remaining == 0u) {
+                renderPending = false;
             } else {
-                warning = error;
-                status = "Render failed";
+                request.samples = accumulateRefinement
+                    ? static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                        remaining, interactiveWorkload.photons))
+                    : interactiveWorkload.photons;
+                request.resolveSamples = accumulateRefinement
+                    ? static_cast<std::uint32_t>(refinementAccumulated + request.samples)
+                    : request.samples;
+                request.sampleOffset = accumulateRefinement ? refinementAccumulated : 0u;
+                request.progressivePass = accumulateRefinement
+                    ? static_cast<std::uint32_t>(refinementAccumulated /
+                        std::max(interactiveWorkload.photons, 1u)) : 0u;
+                request.preserveAccumulation = accumulateRefinement &&
+                                               refinementAccumulated != 0u;
+                request.interactiveInterfaceDepth = interactiveWorkload.interfaceDepth;
+                request.slotAffinity = 0u;
+                std::string error;
+                artworkTicket = artRenderer.submit(request, error);
+                if (artworkTicket) {
+                    pendingArtworkSamples = request.samples;
+                    pendingArtworkRefinement = accumulateRefinement;
+                    renderPending = false;
+                } else if (error != "All asynchronous render slots are busy.") {
+                    warning = error;
+                    status = "Render failed";
+                    renderPending = false;
+                }
             }
-            renderPending = false;
         }
 
         const bool glassPreviewVisible = studio.runtime().uiVisible &&
             (studio.runtime().glassPreviewExpanded ||
              studio.runtime().glassPreviewLightbox);
         const auto currentTime = std::chrono::steady_clock::now();
-        if (glassPreviewPending && glassPreviewVisible && gpuReady &&
+        if (glassPreviewPending && !glassPreviewTicket && glassPreviewVisible && gpuReady &&
             !videoJob.active.load() && currentTime >= nextGlassPreview) {
             glasslight::GlassPreviewRequest request;
             request.settings = studio.settings();
-            request.width = studio.runtime().glassPreviewTargetWidth;
-            request.height = studio.runtime().glassPreviewTargetHeight;
+            const float scale = interactiveWorkload.glassPreviewScale;
+            request.width = std::max(1u, static_cast<std::uint32_t>(std::lround(
+                studio.runtime().glassPreviewTargetWidth * scale)));
+            request.height = std::max(1u, static_cast<std::uint32_t>(std::lround(
+                studio.runtime().glassPreviewTargetHeight * scale)));
             request.orbitYaw = 0.55f + studio.runtime().glassPreviewYaw;
             request.orbitPitch = 0.25f + studio.runtime().glassPreviewPitch;
             request.zoom = studio.runtime().glassPreviewZoom;
-            request.edgeOverlay = studio.effectiveGlassPreviewEdges();
+            request.edgeOverlay = studio.effectiveGlassPreviewEdges() && scale >= 1.0f;
+            request.interactive = !interactiveWorkload.refining;
             std::string error;
-            if (artRenderer.renderGlassPreview(
-                    request, glassPreview, glassPreviewStats, error)) {
-                if (!uploadTexture(presentationRenderer, glassPreviewTexture,
-                                   glassPreview, error)) {
-                    warning = error;
-                }
-            } else {
+            glassPreviewTicket = artRenderer.submitGlassPreview(request, error);
+            if (glassPreviewTicket) {
+                glassPreviewPending = false;
+            } else if (error != "All asynchronous render slots are busy.") {
                 warning = error;
+                glassPreviewPending = false;
             }
-            glassPreviewPending = false;
             const auto interval = studio.runtime().glassPreviewLightbox ||
                                   studio.runtime().glassPreviewOrbiting
                 ? std::chrono::milliseconds(42)
@@ -781,6 +1355,13 @@ int main(int argc, char** argv) {
         }
         return runSmokeTest(glasslight::platform::pathFromUtf8(argv[2]));
     }
+    if (argc >= 2 && std::string(argv[1]) == "--benchmark") {
+        if (argc != 3) {
+            std::cerr << "--benchmark requires exactly one output directory.\n";
+            return 2;
+        }
+        return runBenchmark(glasslight::platform::pathFromUtf8(argv[2]));
+    }
     if (argc >= 2 && std::string(argv[1]) == "--gpu-info") {
         glasslight::VulkanRenderer renderer;
         std::string error;
@@ -811,6 +1392,7 @@ int main(int argc, char** argv) {
             << "  glasslight --render-still FILE [SEED] SHAPE\n"
             << "    SHAPE: auto, pebble, lens, ribbon, faceted-vessel, cut-crystal, fracture\n"
             << "  glasslight --smoke-test DIRECTORY\n"
+            << "  glasslight --benchmark DIRECTORY\n"
             << "  glasslight --video-smoke FILE\n"
             << "  glasslight --list-gpus | --gpu-info\n"
             << "Set GLASSLIGHT_GPU to an exact listed device name to override Auto.\n";

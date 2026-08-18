@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <future>
 #include <limits>
 #include <system_error>
 
@@ -258,6 +259,10 @@ bool exportMp4(const VideoExportConfig& config,
         error = "Video output path is empty.";
         return false;
     }
+    if (callbacks.isCancelled && callbacks.isCancelled()) {
+        error = "Video export cancelled.";
+        return false;
+    }
     std::error_code filesystemError;
     if (!config.overwrite && std::filesystem::exists(config.outputPath, filesystemError)) {
         error = "Video output already exists.";
@@ -326,27 +331,40 @@ bool exportMp4(const VideoExportConfig& config,
     }
 
     std::string processError;
-    std::vector<std::uint8_t> frame;
     const std::size_t expectedFrameBytes = static_cast<std::size_t>(frameBytes64);
+    struct ProducedFrame {
+        bool succeeded = false;
+        std::vector<std::uint8_t> pixels;
+        std::string error;
+    };
+    const auto produce = [&](const std::uint32_t index) {
+        ProducedFrame result;
+        result.succeeded = frameProvider(index, result.pixels, result.error);
+        return result;
+    };
+    std::future<ProducedFrame> pending = std::async(
+        std::launch::async, produce, 0u);
     for (std::uint32_t index = 0; index < config.frameCount; ++index) {
         if (callbacks.isCancelled && callbacks.isCancelled()) {
+            pending.wait();
             terminateProcess(process, input, errorStream, processError);
             SDL_DestroyProcess(process);
             std::filesystem::remove(temporary, filesystemError);
             error = "Video export cancelled.";
             return false;
         }
-        frame.clear();
-        if (!frameProvider(index, frame, error)) {
+        ProducedFrame frame = pending.get();
+        if (!frame.succeeded) {
             terminateProcess(process, input, errorStream, processError);
             SDL_DestroyProcess(process);
             std::filesystem::remove(temporary, filesystemError);
+            error = std::move(frame.error);
             if (error.empty()) {
                 error = "Video frame provider failed at frame " + std::to_string(index) + ".";
             }
             return false;
         }
-        if (frame.size() != expectedFrameBytes) {
+        if (frame.pixels.size() != expectedFrameBytes) {
             terminateProcess(process, input, errorStream, processError);
             SDL_DestroyProcess(process);
             std::filesystem::remove(temporary, filesystemError);
@@ -354,7 +372,15 @@ bool exportMp4(const VideoExportConfig& config,
                     " has the wrong RGBA byte count.";
             return false;
         }
-        if (!writeAll(input, frame.data(), frame.size(), errorStream, processError)) {
+        // Start GPU production of N+1 before handing N to FFmpeg. Together
+        // with the renderer's two reusable slots this overlaps compute with
+        // pipe/codec backpressure while retaining strict frame order.
+        if (index + 1u < config.frameCount) {
+            pending = std::async(std::launch::async, produce, index + 1u);
+        }
+        if (!writeAll(input, frame.pixels.data(), frame.pixels.size(),
+                      errorStream, processError)) {
+            if (pending.valid()) pending.wait();
             terminateProcess(process, input, errorStream, processError);
             SDL_DestroyProcess(process);
             std::filesystem::remove(temporary, filesystemError);
