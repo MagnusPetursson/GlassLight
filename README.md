@@ -33,6 +33,12 @@ the interface.
   then restore those settings later by opening the PNG in GlassLight.
 - Render a deterministic, seamless H.264 MP4 loop of one full rotation.
 
+### See it move
+
+![A monochrome Cut Crystal composition completing a seamless rotation](docs/images/glasslight-loop.gif)
+
+This preview slows the exported rotation for easier viewing.
+
 ![Three artworks exported from GlassLight: Cathedral Faceted, Ember Cut Crystal, and Tidal Ribbon](docs/images/glasslight-gallery.jpg)
 
 <p align="center">
