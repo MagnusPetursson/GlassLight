@@ -13,7 +13,7 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install -y
           cmake ninja-build g++ libvulkan-dev glslang-tools
-          libx11-dev libxrandr-dev libxcursor-dev libxi-dev libudev-dev
+          libx11-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libudev-dev
           desktop-file-utils appstream
       - run: cmake --preset release-linux
       - run: cmake --build --preset release-linux

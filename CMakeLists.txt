@@ -164,11 +164,21 @@ target_link_libraries(glasslight-studio PUBLIC glasslight-core glasslight-imgui)
 if(WIN32)
     configure_file(packaging/windows/glasslight.manifest.in
         ${CMAKE_CURRENT_BINARY_DIR}/glasslight.manifest @ONLY)
+    if(MSVC)
+        set(GLASSLIGHT_MANIFEST_SOURCE
+            ${CMAKE_CURRENT_BINARY_DIR}/glasslight.manifest)
+        set(GLASSLIGHT_MANIFEST_RESOURCE "")
+    else()
+        set(GLASSLIGHT_MANIFEST_SOURCE "")
+        set(GLASSLIGHT_MANIFEST_RESOURCE
+            "1 RT_MANIFEST \"${CMAKE_CURRENT_BINARY_DIR}/glasslight.manifest\"")
+    endif()
     configure_file(packaging/windows/glasslight.rc.in
         ${CMAKE_CURRENT_BINARY_DIR}/glasslight.rc @ONLY)
     add_executable(glasslight WIN32
         src/app/main.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/glasslight.rc
+        ${GLASSLIGHT_MANIFEST_SOURCE}
     )
     set_target_properties(glasslight PROPERTIES OUTPUT_NAME GlassLight)
 else()
