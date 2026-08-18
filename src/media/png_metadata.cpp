@@ -1,4 +1,5 @@
 #include "media/png_metadata.hpp"
+#include "platform/platform.hpp"
 
 #include <SDL3/SDL.h>
 
@@ -57,18 +58,18 @@ bool readFile(const std::filesystem::path& path,
               std::string& error) {
     std::ifstream input(path, std::ios::binary | std::ios::ate);
     if (!input) {
-        error = "Could not open PNG: " + path.string();
+        error = "Could not open PNG: " + platform::pathToUtf8(path);
         return false;
     }
     const std::streamsize size = input.tellg();
     if (size < 0) {
-        error = "Could not determine PNG size: " + path.string();
+        error = "Could not determine PNG size: " + platform::pathToUtf8(path);
         return false;
     }
     bytes.resize(static_cast<std::size_t>(size));
     input.seekg(0, std::ios::beg);
     if (size > 0 && !input.read(reinterpret_cast<char*>(bytes.data()), size)) {
-        error = "Could not read PNG: " + path.string();
+        error = "Could not read PNG: " + platform::pathToUtf8(path);
         return false;
     }
     return true;
@@ -79,7 +80,7 @@ bool writeFile(const std::filesystem::path& path,
                std::string& error) {
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     if (!output) {
-        error = "Could not create PNG: " + path.string();
+        error = "Could not create PNG: " + platform::pathToUtf8(path);
         return false;
     }
     if (!bytes.empty()) {
@@ -88,7 +89,7 @@ bool writeFile(const std::filesystem::path& path,
     }
     output.flush();
     if (!output) {
-        error = "Could not finish writing PNG: " + path.string();
+        error = "Could not finish writing PNG: " + platform::pathToUtf8(path);
         return false;
     }
     return true;
@@ -97,9 +98,9 @@ bool writeFile(const std::filesystem::path& path,
 std::filesystem::path temporarySibling(const std::filesystem::path& path) {
     static std::atomic<std::uint64_t> sequence{0};
     const auto tick = std::chrono::steady_clock::now().time_since_epoch().count();
-    return path.parent_path() /
-           (path.filename().string() + ".tmp." + std::to_string(tick) + "." +
-            std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)));
+    return path.parent_path() / platform::pathFromUtf8(
+        platform::pathToUtf8(path.filename()) + ".tmp." + std::to_string(tick) + "." +
+        std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)));
 }
 
 void appendSettingsChunk(std::vector<std::uint8_t>& output,
@@ -268,7 +269,8 @@ bool savePngWithSettings(const std::filesystem::path& path,
         error = "Could not create SDL PNG surface: " + std::string(SDL_GetError());
         return false;
     }
-    const bool encoded = SDL_SavePNG(surface, temporary.string().c_str());
+    const std::string temporaryUtf8 = platform::pathToUtf8(temporary);
+    const bool encoded = SDL_SavePNG(surface, temporaryUtf8.c_str());
     SDL_DestroySurface(surface);
     if (!encoded) {
         error = "Could not encode PNG: " + std::string(SDL_GetError());
@@ -287,10 +289,9 @@ bool savePngWithSettings(const std::filesystem::path& path,
         return false;
     }
 
-    std::error_code renameError;
-    std::filesystem::rename(temporary, path, renameError);
-    if (renameError) {
-        error = "Could not replace PNG atomically: " + renameError.message();
+    std::string replaceError;
+    if (!platform::replaceFile(temporary, path, replaceError)) {
+        error = "Could not replace PNG atomically: " + replaceError;
         std::error_code ignored;
         std::filesystem::remove(temporary, ignored);
         return false;
@@ -320,7 +321,8 @@ bool loadPngWithSettings(const std::filesystem::path& path,
         settingsJson.clear();
     }
 
-    SDL_Surface* loaded = SDL_LoadPNG(path.string().c_str());
+    const std::string pathUtf8 = platform::pathToUtf8(path);
+    SDL_Surface* loaded = SDL_LoadPNG(pathUtf8.c_str());
     if (!loaded) {
         error = "Could not decode PNG: " + std::string(SDL_GetError());
         return false;

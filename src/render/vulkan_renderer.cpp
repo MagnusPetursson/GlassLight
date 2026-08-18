@@ -1,4 +1,5 @@
 #include "render/vulkan_renderer.hpp"
+#include "platform/platform.hpp"
 #include "core/fracture_layout.hpp"
 
 #include <SDL3/SDL.h>
@@ -19,6 +20,11 @@
 #ifndef GLASSLIGHT_SHADER_DIR
 #define GLASSLIGHT_SHADER_DIR "shaders"
 #endif
+#ifndef GLASSLIGHT_VERSION_MAJOR
+#define GLASSLIGHT_VERSION_MAJOR 0
+#define GLASSLIGHT_VERSION_MINOR 2
+#define GLASSLIGHT_VERSION_PATCH 0
+#endif
 
 namespace glasslight {
 namespace {
@@ -30,18 +36,18 @@ std::string vkError(const char* operation, VkResult result) {
 std::vector<std::uint32_t> readSpirv(const std::filesystem::path& path, std::string& error) {
     std::ifstream input(path, std::ios::binary | std::ios::ate);
     if (!input) {
-        error = "Could not open shader: " + path.string();
+        error = "Could not open shader: " + platform::pathToUtf8(path);
         return {};
     }
     const std::streamsize bytes = input.tellg();
     if (bytes <= 0 || bytes % 4 != 0) {
-        error = "Shader is empty or not valid SPIR-V: " + path.string();
+        error = "Shader is empty or not valid SPIR-V: " + platform::pathToUtf8(path);
         return {};
     }
     input.seekg(0);
     std::vector<std::uint32_t> words(static_cast<std::size_t>(bytes) / 4u);
     if (!input.read(reinterpret_cast<char*>(words.data()), bytes)) {
-        error = "Could not read shader: " + path.string();
+        error = "Could not read shader: " + platform::pathToUtf8(path);
         return {};
     }
     return words;
@@ -335,9 +341,9 @@ struct VulkanRenderer::Impl {
             if (base != nullptr) {
                 const auto fileName = path.filename();
                 const std::array<std::filesystem::path, 2> installedCandidates{{
-                    std::filesystem::path(base) / ".." / "share" / "glasslight" /
+                    platform::pathFromUtf8(base) / ".." / "share" / "glasslight" /
                         "shaders" / fileName,
-                    std::filesystem::path(base) / "shaders" / fileName
+                    platform::pathFromUtf8(base) / "shaders" / fileName
                 }};
                 for (const auto& candidate : installedCandidates) {
                     std::string candidateError;
@@ -576,9 +582,11 @@ bool VulkanRenderer::initialize(const std::string& preferredGpuName, std::string
 
     VkApplicationInfo appInfo{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     appInfo.pApplicationName = "GlassLight";
-    appInfo.applicationVersion = VK_MAKE_API_VERSION(0, 0, 2, 0);
+    appInfo.applicationVersion = VK_MAKE_API_VERSION(
+        0, GLASSLIGHT_VERSION_MAJOR, GLASSLIGHT_VERSION_MINOR,
+        GLASSLIGHT_VERSION_PATCH);
     appInfo.pEngineName = "GlassLight Compute";
-    appInfo.engineVersion = VK_MAKE_API_VERSION(0, 0, 2, 0);
+    appInfo.engineVersion = appInfo.applicationVersion;
     appInfo.apiVersion = VK_API_VERSION_1_2;
 
     VkInstanceCreateInfo instanceInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
@@ -973,7 +981,8 @@ bool savePng(const RenderedImage& image, const std::filesystem::path& path,
         error = std::string("Could not create PNG surface: ") + SDL_GetError();
         return false;
     }
-    const bool saved = SDL_SavePNG(surface, path.string().c_str());
+    const std::string pathUtf8 = platform::pathToUtf8(path);
+    const bool saved = SDL_SavePNG(surface, pathUtf8.c_str());
     if (!saved) error = std::string("Could not save PNG: ") + SDL_GetError();
     SDL_DestroySurface(surface);
     return saved;

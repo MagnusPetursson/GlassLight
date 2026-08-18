@@ -2,11 +2,13 @@
 #include "core/persistence.hpp"
 #include "media/png_metadata.hpp"
 #include "media/video_export.hpp"
+#include "platform/platform.hpp"
 #include "render/vulkan_renderer.hpp"
 #include "studio/studio_ui.hpp"
 
 #include <nlohmann/json.hpp>
 #include <SDL3/SDL.h>
+#include <SDL3/SDL_main.h>
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_sdlrenderer3.h>
@@ -15,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -29,6 +32,13 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #ifndef GLASSLIGHT_VERSION
 #define GLASSLIGHT_VERSION "0.2.0"
 #endif
@@ -38,8 +48,21 @@ namespace {
 constexpr std::uint32_t kPreviewWidth = 1280;
 constexpr std::uint32_t kPreviewHeight = 720;
 
+void attachParentConsoleForCli() {
+#if defined(_WIN32)
+    if (AttachConsole(ATTACH_PARENT_PROCESS) == 0) {
+        return;
+    }
+    FILE* stream = nullptr;
+    freopen_s(&stream, "CONOUT$", "w", stdout);
+    freopen_s(&stream, "CONOUT$", "w", stderr);
+    SetConsoleOutputCP(CP_UTF8);
+#endif
+}
+
 std::string preferredGpuName() {
-    const char* value = std::getenv("GLASSLIGHT_GPU");
+    const char* value = SDL_GetEnvironmentVariable(
+        SDL_GetEnvironment(), "GLASSLIGHT_GPU");
     return value ? std::string(value) : std::string{};
 }
 
@@ -161,7 +184,7 @@ void SDLCALL dialogCallback(void* userdata, const char* const* fileList, int) {
     if (!fileList) {
         state.error = SDL_GetError();
     } else if (fileList[0]) {
-        state.selection = std::filesystem::path(fileList[0]);
+        state.selection = glasslight::platform::pathFromUtf8(fileList[0]);
     }
     state.active = false;
     state.ready = true;
@@ -556,7 +579,8 @@ int runStudio() {
                                 studio.setSettings(restored, true);
                                 studio.mutableRuntime().playing = false;
                                 glassPreviewPending = true;
-                                status = "Restored " + result->selection->filename().string();
+                                status = "Restored " + glasslight::platform::pathToUtf8(
+                                    result->selection->filename());
                                 warning.clear();
                                 glasslight::saveLastSession(studio.settings(), error);
                             } else {
@@ -578,7 +602,8 @@ int runStudio() {
                         glasslight::media::savePngWithSettings(
                             destination, asMediaImage(still),
                             glasslight::serializeSettings(settings), error)) {
-                        status = "Saved " + destination.filename().string();
+                        status = "Saved " + glasslight::platform::pathToUtf8(
+                            destination.filename());
                         warning.clear();
                     } else {
                         warning = error;
@@ -594,7 +619,8 @@ int runStudio() {
                     } else {
                         const auto ffmpeg = glasslight::media::findFfmpeg();
                         if (!ffmpeg) {
-                            warning = "FFmpeg was not found. Install ffmpeg to export MP4.";
+                            warning = "FFmpeg was not found beside GlassLight or on PATH. "
+                                      "Add ffmpeg.exe beside the app or install FFmpeg.";
                         } else {
                             videoJob.join();
                             videoJob.cancel.store(false);
@@ -648,7 +674,8 @@ int runStudio() {
                                     std::scoped_lock lock(videoJob.resultMutex);
                                     videoJob.succeeded = succeeded;
                                     videoJob.message = succeeded
-                                        ? "Saved " + destination.filename().string()
+                                        ? "Saved " + glasslight::platform::pathToUtf8(
+                                            destination.filename())
                                         : exportError;
                                 }
                                 videoJob.active.store(false);
@@ -740,6 +767,9 @@ int runStudio() {
 } // namespace
 
 int main(int argc, char** argv) {
+    if (argc >= 2) {
+        attachParentConsoleForCli();
+    }
     if (argc >= 2 && std::string(argv[1]) == "--version") {
         std::cout << "GlassLight " << GLASSLIGHT_VERSION << '\n';
         return 0;
@@ -749,7 +779,7 @@ int main(int argc, char** argv) {
             std::cerr << "--smoke-test requires an output directory.\n";
             return 2;
         }
-        return runSmokeTest(argv[2]);
+        return runSmokeTest(glasslight::platform::pathFromUtf8(argv[2]));
     }
     if (argc >= 2 && std::string(argv[1]) == "--gpu-info") {
         glasslight::VulkanRenderer renderer;
@@ -787,7 +817,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (argc >= 3 && std::string(argv[1]) == "--video-smoke") {
-        return runVideoSmoke(argv[2]);
+        return runVideoSmoke(glasslight::platform::pathFromUtf8(argv[2]));
     }
     if (argc >= 3 && std::string(argv[1]) == "--render-still") {
         std::uint64_t seed = 0;
@@ -809,7 +839,8 @@ int main(int argc, char** argv) {
             }
             family = *parsed;
         }
-        return renderStillFromCli(argv[2], seed, family);
+        return renderStillFromCli(
+            glasslight::platform::pathFromUtf8(argv[2]), seed, family);
     }
     return runStudio();
 }

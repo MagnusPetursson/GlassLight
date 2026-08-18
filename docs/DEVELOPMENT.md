@@ -36,6 +36,20 @@ cmake --build --preset release-linux
 Both presets enable the test targets. Their build directories live below
 `build/` and are ignored by Git.
 
+On Windows 10 or 11 x64, install Visual Studio 2022 Build Tools with the C++
+workload, Ninja, CMake, and the LunarG Vulkan SDK. Open an x64 Native Tools
+terminal and run:
+
+```powershell
+cmake --preset release-windows
+cmake --build --preset release-windows
+ctest --preset release-windows
+```
+
+The Vulkan SDK is a build dependency and supplies headers, the import library,
+and `glslangValidator`. End users need only the Vulkan runtime installed by a
+current GPU driver.
+
 ## Project layout
 
 - `src/core/` owns compositions, deterministic seeds, validation, persistence,
@@ -45,10 +59,11 @@ Both presets enable the test targets. Their build directories live below
 - `src/studio/` and `src/app/` contain the ImGui interface, SDL application,
   dialogs, export coordination, and CLI entry point.
 - `src/media/` implements PNG composition metadata and FFmpeg-backed MP4
-  export.
+  export; `src/platform/` owns UTF-8 paths, durable writes, and native replace
+  semantics.
 - `tests/` contains CPU tests, GPU structural validation, benchmarks, and the
-  curated seed gallery. `packaging/linux/` contains desktop metadata and
-  package scripts.
+  curated seed gallery. `packaging/` contains Linux integration and Windows
+  resources/package verification.
 
 ## CLI and GPU selection
 
@@ -157,8 +172,10 @@ stored in versioned comment metadata.
 
 Composition schema v2 stores Fracture shard count, morphology, and motion below
 `shape.fracture`. Schema v1 sessions and PNGs migrate to `9 / Auto / Auto`.
-The last session is stored at `$XDG_CONFIG_HOME/glasslight/settings.json`, or
-`~/.config/glasslight/settings.json` when `XDG_CONFIG_HOME` is unset.
+On Linux, the last session is stored at
+`$XDG_CONFIG_HOME/glasslight/settings.json`, or
+`~/.config/glasslight/settings.json` when `XDG_CONFIG_HOME` is unset. Windows
+uses `%APPDATA%\GlassLight\settings.json`.
 
 ## Linux packages
 
@@ -187,5 +204,29 @@ appstreamcli validate --no-net \
 ```
 
 The package metadata and desktop integration must remain relocatable and free
-of machine-specific absolute paths. The current package target is Linux
-x86_64; Windows packaging and a CPU/OpenGL fallback are not yet provided.
+of machine-specific absolute paths.
+
+## Windows package
+
+Build and test the release preset, then create the portable ZIP:
+
+```powershell
+cpack --config build/release-windows/CPackConfig.cmake -G ZIP -B dist
+./packaging/windows/verify-package.ps1 `
+    -Archive dist/GlassLight-0.2.0-windows-x64.zip
+```
+
+The archive contains only `GlassLight.exe`, the five compiled shaders, and the
+README/license notices. It does not contain FFmpeg, the Vulkan SDK or runtime,
+demo exports, screenshots, or an installer. MP4 export searches first for
+`ffmpeg.exe` beside the application and then on `PATH`.
+
+GitHub Actions builds this ZIP natively with MSVC on every push and pull
+request. Before tagging a release, download that artifact and validate launch,
+high-DPI behavior, every glass family, Unicode PNG save/restore, AppData state,
+and MP4 export on a physical Windows Vulkan 1.2 GPU. Hosted CI validates the
+build and CPU tests but is not a physical-GPU rendering gate.
+
+Tags matching `v*` must equal the CMake project version. A `v0.2.0` tag builds
+the AppImage, DEB, and Windows ZIP, generates one `SHA256SUMS`, and publishes a
+normal GitHub release.

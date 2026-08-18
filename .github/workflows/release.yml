@@ -1,0 +1,120 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Verify tag matches source version
+        shell: bash
+        run: |
+          version="$(sed -n 's/^project(GlassLight VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)"
+          test "$GITHUB_REF_NAME" = "v$version"
+      - name: Install build dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          cmake ninja-build g++ libvulkan-dev glslang-tools
+          libx11-dev libxrandr-dev libxcursor-dev libxi-dev libudev-dev
+          desktop-file-utils appstream curl
+      - run: cmake --preset release-linux
+      - run: cmake --build --preset release-linux
+      - run: ctest --preset release-linux
+      - name: Verify Linux install tree
+        run: |
+          DESTDIR="$PWD/build/install-check" cmake --install build/release-linux --prefix /usr
+          bash packaging/linux/verify-install-tree.sh build/install-check
+      - name: Build DEB
+        run: |
+          bash packaging/linux/build-deb.sh build/release-linux dist
+          dpkg-deb --contents dist/glasslight_0.2.0_amd64.deb
+      - name: Build AppImage with pinned linuxdeploy
+        run: |
+          curl -fL https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage -o linuxdeploy-x86_64.AppImage
+          echo "c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d  linuxdeploy-x86_64.AppImage" | sha256sum -c -
+          chmod +x linuxdeploy-x86_64.AppImage
+          LINUXDEPLOY="$PWD/linuxdeploy-x86_64.AppImage" bash packaging/linux/build-appimage.sh build/release-linux dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-release
+          path: |
+            dist/GlassLight-0.2.0-x86_64.AppImage
+            dist/glasslight_0.2.0_amd64.deb
+          if-no-files-found: error
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Verify tag matches source version
+        shell: pwsh
+        run: |
+          $match = Select-String -Path CMakeLists.txt -Pattern '^project\(GlassLight VERSION ([0-9.]+)'
+          if ($null -eq $match -or $match.Matches.Count -ne 1) { throw "Could not read source version." }
+          $version = $match.Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_NAME -ne "v$version") { throw "Tag and source version differ." }
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: amd64
+      - name: Install pinned Vulkan SDK
+        shell: pwsh
+        run: |
+          $version = "1.4.350.0"
+          $expected = "855b27ba05d2d8119c5114c5d4ff870ca38f2c632b11e1bb9923b9b7e6ecfe7b"
+          $installer = Join-Path $env:RUNNER_TEMP "vulkan-sdk.exe"
+          $sdk = Join-Path $env:RUNNER_TEMP "VulkanSDK-$version"
+          Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/$version/windows/vulkan_sdk.exe" -OutFile $installer
+          $actual = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "Vulkan SDK checksum mismatch: $actual" }
+          $process = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList @(
+            "--root", $sdk, "--accept-licenses", "--default-answer",
+            "--confirm-command", "install", "copy_only=1"
+          )
+          if ($process.ExitCode -ne 0) { throw "Vulkan SDK install failed: $($process.ExitCode)" }
+          "VULKAN_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          (Join-Path $sdk "Bin") | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - run: cmake --preset release-windows
+      - run: cmake --build --preset release-windows
+      - run: ctest --preset release-windows
+      - name: Build and verify Windows ZIP
+        shell: pwsh
+        run: |
+          cpack --config build/release-windows/CPackConfig.cmake -G ZIP -B dist
+          ./packaging/windows/verify-package.ps1 -Archive dist/GlassLight-0.2.0-windows-x64.zip
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-release
+          path: dist/GlassLight-0.2.0-windows-x64.zip
+          if-no-files-found: error
+
+  publish:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Verify release set and write checksums
+        working-directory: dist
+        run: |
+          test -f GlassLight-0.2.0-x86_64.AppImage
+          test -f glasslight_0.2.0_amd64.deb
+          test -f GlassLight-0.2.0-windows-x64.zip
+          sha256sum GlassLight-0.2.0-x86_64.AppImage glasslight_0.2.0_amd64.deb GlassLight-0.2.0-windows-x64.zip > SHA256SUMS
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          prerelease: false
+          make_latest: true
+          generate_release_notes: true
+          files: |
+            dist/GlassLight-0.2.0-x86_64.AppImage
+            dist/glasslight_0.2.0_amd64.deb
+            dist/GlassLight-0.2.0-windows-x64.zip
+            dist/SHA256SUMS

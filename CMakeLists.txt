@@ -9,9 +9,13 @@ include(GNUInstallDirs)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static dependencies" FORCE)
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY
+        "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING "" FORCE)
+endif()
 
-find_package(Vulkan 1.2 REQUIRED)
-find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
+find_package(Vulkan 1.2 REQUIRED COMPONENTS glslangValidator)
 
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC ON CACHE BOOL "" FORCE)
@@ -84,7 +88,7 @@ foreach(shader IN LISTS GLASSLIGHT_SHADER_SOURCES)
     add_custom_command(
         OUTPUT "${shader_binary}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GLASSLIGHT_COMPILED_SHADER_DIR}"
-        COMMAND ${GLSLANG_VALIDATOR} -V --target-env vulkan1.2
+        COMMAND Vulkan::glslangValidator -V --target-env vulkan1.2
                 "-I${GLASSLIGHT_SHADER_DIR}" "${shader}" -o "${shader_binary}"
         DEPENDS "${shader}" "${GLASSLIGHT_SHADER_DIR}/geometry.glsl"
         VERBATIM
@@ -97,7 +101,7 @@ foreach(shader_name IN ITEMS first_light.comp glass_preview.comp)
     add_custom_command(
         OUTPUT "${shader_binary}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GLASSLIGHT_COMPILED_SHADER_DIR}"
-        COMMAND ${GLSLANG_VALIDATOR} -V --target-env vulkan1.2
+        COMMAND Vulkan::glslangValidator -V --target-env vulkan1.2
                 -DGLASSLIGHT_FRACTURE_SHADER=1
                 "-I${GLASSLIGHT_SHADER_DIR}" "${shader}" -o "${shader_binary}"
         DEPENDS "${shader}" "${GLASSLIGHT_SHADER_DIR}/geometry.glsl"
@@ -107,13 +111,24 @@ foreach(shader_name IN ITEMS first_light.comp glass_preview.comp)
 endforeach()
 add_custom_target(glasslight-shaders DEPENDS ${GLASSLIGHT_SHADER_BINARIES})
 
+add_library(glasslight-platform STATIC
+    src/platform/platform.cpp
+)
+target_include_directories(glasslight-platform PUBLIC src)
+if(WIN32)
+    target_link_libraries(glasslight-platform PRIVATE ole32 shell32 uuid)
+endif()
+
 add_library(glasslight-core STATIC
     src/core/composition.cpp
     src/core/fracture_layout.cpp
     src/core/persistence.cpp
 )
 target_include_directories(glasslight-core PUBLIC src)
-target_link_libraries(glasslight-core PUBLIC nlohmann_json::nlohmann_json)
+target_link_libraries(glasslight-core PUBLIC
+    glasslight-platform
+    nlohmann_json::nlohmann_json
+)
 
 add_library(glasslight-render STATIC
     src/render/vulkan_renderer.cpp
@@ -125,6 +140,7 @@ target_compile_definitions(glasslight-render PRIVATE
 )
 target_link_libraries(glasslight-render PUBLIC
     glasslight-core
+    glasslight-platform
     Vulkan::Vulkan
     SDL3::SDL3-static
 )
@@ -134,7 +150,10 @@ add_library(glasslight-media STATIC
     src/media/video_export.cpp
 )
 target_include_directories(glasslight-media PUBLIC src)
-target_link_libraries(glasslight-media PUBLIC SDL3::SDL3-static)
+target_link_libraries(glasslight-media PUBLIC
+    glasslight-platform
+    SDL3::SDL3-static
+)
 
 add_library(glasslight-studio STATIC
     src/studio/studio_ui.cpp
@@ -142,9 +161,19 @@ add_library(glasslight-studio STATIC
 target_include_directories(glasslight-studio PUBLIC src)
 target_link_libraries(glasslight-studio PUBLIC glasslight-core glasslight-imgui)
 
-add_executable(glasslight
-    src/app/main.cpp
-)
+if(WIN32)
+    configure_file(packaging/windows/glasslight.manifest.in
+        ${CMAKE_CURRENT_BINARY_DIR}/glasslight.manifest @ONLY)
+    configure_file(packaging/windows/glasslight.rc.in
+        ${CMAKE_CURRENT_BINARY_DIR}/glasslight.rc @ONLY)
+    add_executable(glasslight WIN32
+        src/app/main.cpp
+        ${CMAKE_CURRENT_BINARY_DIR}/glasslight.rc
+    )
+    set_target_properties(glasslight PROPERTIES OUTPUT_NAME GlassLight)
+else()
+    add_executable(glasslight src/app/main.cpp)
+endif()
 target_link_libraries(glasslight PRIVATE
     glasslight-core
     glasslight-render
@@ -154,9 +183,19 @@ target_link_libraries(glasslight PRIVATE
     nlohmann_json::nlohmann_json
 )
 target_compile_definitions(glasslight PRIVATE GLASSLIGHT_VERSION="${PROJECT_VERSION}")
+target_compile_definitions(glasslight-render PRIVATE
+    GLASSLIGHT_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    GLASSLIGHT_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    GLASSLIGHT_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+)
 
 if(MSVC)
     target_compile_options(glasslight PRIVATE /W4 /permissive-)
+    target_compile_options(glasslight-platform PRIVATE /W4 /permissive-)
+    target_compile_options(glasslight-core PRIVATE /W4 /permissive-)
+    target_compile_options(glasslight-render PRIVATE /W4 /permissive-)
+    target_compile_options(glasslight-media PRIVATE /W4 /permissive-)
+    target_compile_options(glasslight-studio PRIVATE /W4 /permissive-)
 else()
     target_compile_options(glasslight PRIVATE -Wall -Wextra -Wpedantic)
     target_compile_options(glasslight-core PRIVATE -Wall -Wextra -Wpedantic)
@@ -167,6 +206,7 @@ else()
         -Wall -Wextra -Wpedantic -Wno-missing-field-initializers)
     target_compile_options(glasslight-media PRIVATE -Wall -Wextra -Wpedantic)
     target_compile_options(glasslight-studio PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(glasslight-platform PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 if(BUILD_TESTING)
@@ -187,6 +227,10 @@ if(BUILD_TESTING)
         glasslight-studio glasslight-core)
     add_test(NAME studio-state COMMAND glasslight-studio-state-tests)
 
+    add_executable(glasslight-platform-tests tests/platform_tests.cpp)
+    target_link_libraries(glasslight-platform-tests PRIVATE glasslight-platform)
+    add_test(NAME platform COMMAND glasslight-platform-tests)
+
     # GPU-dependent structural and gallery validation remains opt-in rather
     # than part of CTest so headless/non-Vulkan build machines stay supported.
     add_executable(glasslight-render-validation tests/render_validation.cpp)
@@ -194,28 +238,43 @@ if(BUILD_TESTING)
         glasslight-render glasslight-media glasslight-core)
 endif()
 
-install(TARGETS glasslight RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(FILES ${GLASSLIGHT_SHADER_BINARIES}
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/glasslight/shaders)
-install(FILES packaging/linux/is.magnusp.glasslight.desktop
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
-install(FILES assets/glasslight.svg
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps
-    RENAME is.magnusp.glasslight.svg)
-install(FILES packaging/linux/is.magnusp.glasslight.appdata.xml
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/metainfo)
-install(FILES LICENSE THIRD_PARTY_NOTICES.md
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/glasslight)
+if(WIN32)
+    install(TARGETS glasslight RUNTIME DESTINATION .)
+    install(FILES ${GLASSLIGHT_SHADER_BINARIES} DESTINATION shaders)
+    install(FILES README.md LICENSE THIRD_PARTY_NOTICES.md DESTINATION .)
+else()
+    install(TARGETS glasslight RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(FILES ${GLASSLIGHT_SHADER_BINARIES}
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/glasslight/shaders)
+    if(UNIX AND NOT APPLE)
+        install(FILES packaging/linux/is.magnusp.glasslight.desktop
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+        install(FILES assets/glasslight.svg
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps
+            RENAME is.magnusp.glasslight.svg)
+        install(FILES packaging/linux/is.magnusp.glasslight.appdata.xml
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/metainfo)
+    endif()
+    install(FILES LICENSE THIRD_PARTY_NOTICES.md
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/glasslight)
+endif()
 
-set(CPACK_GENERATOR "DEB")
 set(CPACK_PACKAGE_NAME "glasslight")
-set(CPACK_PACKAGE_VENDOR "GlassLight")
+set(CPACK_PACKAGE_VENDOR "Magnus Petursson")
 set(CPACK_PACKAGE_CONTACT "GlassLight maintainers")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
     "Seeded Vulkan caustic generative-art studio")
 set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
-set(CPACK_DEBIAN_PACKAGE_SECTION "graphics")
-set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
-set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "ffmpeg")
-set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+if(WIN32)
+    set(CPACK_GENERATOR "ZIP")
+    set(CPACK_PACKAGE_FILE_NAME "GlassLight-${PROJECT_VERSION}-windows-x64")
+    set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY ON)
+else()
+    set(CPACK_GENERATOR "DEB")
+    set(CPACK_DEBIAN_PACKAGE_SECTION "graphics")
+    set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+    set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "ffmpeg")
+    set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+endif()
 include(CPack)

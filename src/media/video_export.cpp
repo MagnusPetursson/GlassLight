@@ -1,4 +1,5 @@
 #include "media/video_export.hpp"
+#include "platform/platform.hpp"
 
 #include <SDL3/SDL.h>
 
@@ -35,10 +36,9 @@ bool isExecutable(const std::filesystem::path& path) {
 std::filesystem::path temporaryMp4Sibling(const std::filesystem::path& path) {
     static std::atomic<std::uint64_t> sequence{0};
     const auto tick = std::chrono::steady_clock::now().time_since_epoch().count();
-    const std::string stem = path.stem().string();
-    return path.parent_path() /
-           (stem + ".tmp." + std::to_string(tick) + "." +
-            std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)) + ".mp4");
+    return path.parent_path() / platform::pathFromUtf8(
+        platform::pathToUtf8(path.stem()) + ".tmp." + std::to_string(tick) + "." +
+        std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)) + ".mp4");
 }
 
 void drainErrors(SDL_IOStream* stream, std::string& output) {
@@ -139,17 +139,25 @@ findFfmpeg(const std::filesystem::path& preferred) {
         return std::nullopt;
     }
 
-    const char* pathVariable = std::getenv("PATH");
-    if (!pathVariable) {
-        return std::nullopt;
-    }
 #if defined(_WIN32)
     constexpr char separator = ';';
     constexpr const char* executableName = "ffmpeg.exe";
+    if (const char* basePath = SDL_GetBasePath(); basePath != nullptr) {
+        const std::filesystem::path adjacent =
+            platform::pathFromUtf8(basePath) / executableName;
+        if (isExecutable(adjacent)) {
+            return std::filesystem::absolute(adjacent);
+        }
+    }
 #else
     constexpr char separator = ':';
     constexpr const char* executableName = "ffmpeg";
 #endif
+    const char* pathVariable =
+        SDL_GetEnvironmentVariable(SDL_GetEnvironment(), "PATH");
+    if (!pathVariable) {
+        return std::nullopt;
+    }
     const std::string searchPath(pathVariable);
     std::size_t start = 0;
     while (start <= searchPath.size()) {
@@ -158,7 +166,7 @@ findFfmpeg(const std::filesystem::path& preferred) {
             start, end == std::string::npos ? std::string::npos : end - start);
         const std::filesystem::path candidate =
             (directory.empty() ? std::filesystem::current_path()
-                               : std::filesystem::path(directory)) /
+                               : platform::pathFromUtf8(directory)) /
             executableName;
         if (isExecutable(candidate)) {
             return std::filesystem::absolute(candidate);
@@ -200,7 +208,7 @@ std::vector<std::string> buildFfmpegArguments(const VideoExportConfig& config) {
     const std::filesystem::path executable =
         config.ffmpegPath.empty() ? std::filesystem::path("ffmpeg") : config.ffmpegPath;
     return {
-        executable.string(),
+        platform::pathToUtf8(executable),
         "-hide_banner",
         "-loglevel", "error",
         "-nostats",
@@ -217,7 +225,7 @@ std::vector<std::string> buildFfmpegArguments(const VideoExportConfig& config) {
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
         "-metadata", "comment=" + makeMp4Comment(config.settingsJson),
-        config.outputPath.string()
+        platform::pathToUtf8(config.outputPath)
     };
 }
 
@@ -266,9 +274,10 @@ bool exportMp4(const VideoExportConfig& config,
     const auto ffmpeg = findFfmpeg(config.ffmpegPath);
     if (!ffmpeg) {
         error = config.ffmpegPath.empty()
-                    ? "FFmpeg was not found on PATH. Install ffmpeg to export MP4 video."
+                    ? "FFmpeg was not found beside GlassLight or on PATH. "
+                      "Add ffmpeg.exe beside the app or install FFmpeg to export MP4 video."
                     : "The configured FFmpeg executable is unavailable: " +
-                          config.ffmpegPath.string();
+                          platform::pathToUtf8(config.ffmpegPath);
         return false;
     }
 
@@ -370,10 +379,10 @@ bool exportMp4(const VideoExportConfig& config,
         return false;
     }
 
-    std::filesystem::rename(temporary, config.outputPath, filesystemError);
-    if (filesystemError) {
+    std::string replaceError;
+    if (!platform::replaceFile(temporary, config.outputPath, replaceError)) {
         std::filesystem::remove(temporary, filesystemError);
-        error = "Could not replace video output atomically: " + filesystemError.message();
+        error = "Could not replace video output atomically: " + replaceError;
         return false;
     }
     return true;

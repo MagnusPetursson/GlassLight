@@ -20,11 +20,35 @@
         "CMAKE_BUILD_TYPE": "Release",
         "BUILD_TESTING": "ON"
       }
+    },
+    {
+      "name": "release-windows",
+      "displayName": "Windows x64 release (MSVC)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/release-windows",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "BUILD_TESTING": "ON"
+      }
     }
   ],
   "buildPresets": [
     { "name": "dev-linux", "configurePreset": "dev-linux" },
-    { "name": "release-linux", "configurePreset": "release-linux" }
+    { "name": "release-linux", "configurePreset": "release-linux" },
+    {
+      "name": "release-windows",
+      "configurePreset": "release-windows",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    }
   ],
   "testPresets": [
     {
@@ -36,7 +60,16 @@
       "name": "release-linux",
       "configurePreset": "release-linux",
       "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "release-windows",
+      "configurePreset": "release-windows",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "output": { "outputOnFailure": true }
     }
   ]
 }
-

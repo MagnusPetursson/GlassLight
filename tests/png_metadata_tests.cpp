@@ -1,5 +1,6 @@
 #include "media/png_metadata.hpp"
 #include "core/composition.hpp"
+#include "platform/platform.hpp"
 
 #include <algorithm>
 #include <array>
@@ -46,9 +47,11 @@ int main() {
     const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
     const std::filesystem::path directory =
         std::filesystem::temp_directory_path() /
-        ("glasslight-png-tests-" + std::to_string(unique));
+        glasslight::platform::pathFromUtf8(
+            "glasslight-png-tests-\xc3\x9e\xc3\xb3r-" + std::to_string(unique));
     std::filesystem::create_directories(directory);
-    const std::filesystem::path pngPath = directory / "composition.png";
+    const std::filesystem::path pngPath =
+        directory / glasslight::platform::pathFromUtf8("composition-\xe5\x85\x89.png");
 
     RgbaImage source;
     source.width = 3;

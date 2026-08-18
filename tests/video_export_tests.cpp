@@ -1,8 +1,12 @@
 #include "media/video_export.hpp"
+#include "platform/platform.hpp"
+
+#include <SDL3/SDL.h>
 
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -51,9 +55,10 @@ int main() {
 
     const std::vector<std::string> arguments =
         glasslight::media::buildFfmpegArguments(config);
-    expect(!arguments.empty() && arguments.front() == config.ffmpegPath.string(),
+    expect(!arguments.empty() && arguments.front() ==
+               glasslight::platform::pathToUtf8(config.ffmpegPath),
            "first argv element should be the configured executable");
-    expect(arguments.back() == config.outputPath.string(),
+    expect(arguments.back() == glasslight::platform::pathToUtf8(config.outputPath),
            "output path with spaces should remain one argv element");
     expect(findArgument(arguments, "-f") + 1u < arguments.size() &&
                arguments[findArgument(arguments, "-f") + 1u] == "rawvideo",
@@ -102,10 +107,15 @@ int main() {
     // unit test usable on systems that intentionally omit video support.
     if (const auto ffmpeg = glasslight::media::findFfmpeg()) {
         const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+        const std::filesystem::path outputDirectory =
+            std::filesystem::temp_directory_path() /
+            glasslight::platform::pathFromUtf8(
+                "glasslight-video-test-\xc3\x9e\xc3\xb3r-" + std::to_string(unique));
+        std::filesystem::create_directories(outputDirectory);
         VideoExportConfig tiny;
         tiny.ffmpegPath = *ffmpeg;
-        tiny.outputPath = std::filesystem::temp_directory_path() /
-                          ("glasslight-video-test-" + std::to_string(unique) + ".mp4");
+        tiny.outputPath = outputDirectory /
+            glasslight::platform::pathFromUtf8("seamless-\xe5\x85\x89.mp4");
         tiny.width = 2;
         tiny.height = 2;
         tiny.fps = 2;
@@ -130,8 +140,36 @@ int main() {
         expect(std::filesystem::file_size(tiny.outputPath, fileError) > 0u && !fileError,
                "tiny MP4 should be nonempty");
         expect(completed == tiny.frameCount, "progress should report every encoded frame");
-        std::filesystem::remove(tiny.outputPath, fileError);
+        error.clear();
+        expect(glasslight::media::exportMp4(
+                   tiny,
+                   [](std::uint32_t, std::vector<std::uint8_t>& rgba, std::string&) {
+                       rgba.assign(16u, 128u);
+                       return true;
+                   },
+                   {}, error),
+               "existing MP4 should be atomically replaceable: " + error);
+        std::filesystem::remove_all(outputDirectory, fileError);
     }
+
+#if defined(_WIN32)
+    if (const char* basePath = SDL_GetBasePath(); basePath != nullptr) {
+        const std::filesystem::path adjacent =
+            glasslight::platform::pathFromUtf8(basePath) / "ffmpeg.exe";
+        std::error_code fileError;
+        const bool alreadyPresent = std::filesystem::exists(adjacent, fileError);
+        if (!alreadyPresent && !fileError) {
+            std::ofstream placeholder(adjacent, std::ios::binary);
+            placeholder.put('\0');
+            placeholder.close();
+            const auto discovered = glasslight::media::findFfmpeg();
+            expect(discovered && std::filesystem::equivalent(
+                       *discovered, adjacent, fileError),
+                   "Windows should discover ffmpeg.exe beside the application");
+            std::filesystem::remove(adjacent, fileError);
+        }
+    }
+#endif
 
     if (failures == 0) {
         std::cout << "Video export configuration tests passed.\n";

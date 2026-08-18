@@ -257,9 +257,8 @@ int main() {
            "a stationary composition should not claim a loop duration");
 
     // Exercise the actual last-session save/load path without touching the
-    // user's config. This is intentionally Linux-focused because 0.2.0 is a
-    // Linux release; the production persistence implementation remains
-    // portable.
+    // user's config. XDG_CONFIG_HOME is also honored as a test override by the
+    // Windows implementation.
     const char* previousConfig = std::getenv("XDG_CONFIG_HOME");
     const std::string previousConfigValue = previousConfig ? previousConfig : "";
     const bool hadPreviousConfig = previousConfig != nullptr;

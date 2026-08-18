@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Shape light through invisible procedural glass.</strong><br>
-  A native, seed-driven generative art studio for Linux.
+  A native, seed-driven generative art studio for Windows and Linux.
 </p>
 
 ![The GlassLight studio showing a Cut Crystal composition and its glass object preview](docs/images/glasslight-studio.png)
@@ -18,7 +18,7 @@ the interface.
 
 <p align="center">
   <a href="https://github.com/MagnusPetursson/GlassLight/releases/latest"><strong>Download the latest release</strong></a>
-  · Linux x86_64 · Vulkan 1.2 · MIT
+  · Windows / Linux x64 · Vulkan 1.2 · MIT
 </p>
 
 ## Create with light
@@ -49,8 +49,18 @@ This preview slows the exported rotation for easier viewing.
 
 ## Install
 
-Download either package from the
+Download the package for your platform from the
 [latest release](https://github.com/MagnusPetursson/GlassLight/releases/latest).
+
+### Windows
+
+Download `GlassLight-*-windows-x64.zip`, extract the whole folder, and run
+`GlassLight.exe`. Keep the `shaders` folder beside the executable. Releases are
+currently unsigned, so Windows may show a SmartScreen warning the first time
+you open the app.
+
+For MP4 export, place `ffmpeg.exe` beside `GlassLight.exe` or install FFmpeg on
+`PATH`. PNG creation and restoration work without FFmpeg.
 
 ### AppImage
 
@@ -69,8 +79,8 @@ Install the downloaded Debian package with APT:
 sudo apt install ./glasslight_*_amd64.deb
 ```
 
-GlassLight requires a Vulkan 1.2-capable GPU. FFmpeg is optional and is needed
-only for MP4 export; PNG export works without it.
+GlassLight requires a Vulkan 1.2-capable GPU with a current graphics driver.
+FFmpeg is optional and is needed only for MP4 export.
 
 ## Make your first composition
 
@@ -95,14 +105,24 @@ cmake --build --preset dev-linux
 ./build/dev-linux/glasslight
 ```
 
+On Windows, use Visual Studio 2022 Build Tools, Ninja, and the LunarG Vulkan
+SDK, then configure the x64 Native Tools terminal with:
+
+```powershell
+cmake --preset release-windows
+cmake --build --preset release-windows
+ctest --preset release-windows
+```
+
 SDL 3, Dear ImGui, Vulkan Memory Allocator, and JSON for Modern C++ are pinned
 and fetched during configuration. See [Development](docs/DEVELOPMENT.md) for
 the project layout, CLI, tests, GPU validation, benchmarks, and packaging.
 
 ## Platform and license
 
-The current release targets Linux x86_64. Windows packaging and a CPU/OpenGL
-fallback are not included yet.
+The current release targets Windows 10/11 x64 and Linux x86_64. A CPU/OpenGL
+fallback, ARM64 packages, installers, automatic updates, and signed Windows
+binaries are not included yet.
 
 GlassLight is available under the [MIT License](LICENSE). Third-party licenses
 are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

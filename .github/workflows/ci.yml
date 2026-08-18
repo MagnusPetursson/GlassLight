@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install build dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          cmake ninja-build g++ libvulkan-dev glslang-tools
+          libx11-dev libxrandr-dev libxcursor-dev libxi-dev libudev-dev
+          desktop-file-utils appstream
+      - run: cmake --preset release-linux
+      - run: cmake --build --preset release-linux
+      - run: ctest --preset release-linux
+      - name: Verify Linux install tree
+        run: |
+          DESTDIR="$PWD/build/install-check" cmake --install build/release-linux --prefix /usr
+          bash packaging/linux/verify-install-tree.sh build/install-check
+      - name: Build and inspect DEB
+        run: |
+          bash packaging/linux/build-deb.sh build/release-linux dist
+          dpkg-deb --contents dist/glasslight_0.2.0_amd64.deb
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: amd64
+      - name: Install pinned Vulkan SDK
+        shell: pwsh
+        run: |
+          $version = "1.4.350.0"
+          $expected = "855b27ba05d2d8119c5114c5d4ff870ca38f2c632b11e1bb9923b9b7e6ecfe7b"
+          $installer = Join-Path $env:RUNNER_TEMP "vulkan-sdk.exe"
+          $sdk = Join-Path $env:RUNNER_TEMP "VulkanSDK-$version"
+          Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/$version/windows/vulkan_sdk.exe" -OutFile $installer
+          $actual = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "Vulkan SDK checksum mismatch: $actual" }
+          $process = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList @(
+            "--root", $sdk, "--accept-licenses", "--default-answer",
+            "--confirm-command", "install", "copy_only=1"
+          )
+          if ($process.ExitCode -ne 0) { throw "Vulkan SDK install failed: $($process.ExitCode)" }
+          "VULKAN_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          (Join-Path $sdk "Bin") | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - run: cmake --preset release-windows
+      - run: cmake --build --preset release-windows
+      - run: ctest --preset release-windows
+      - name: Build and verify Windows ZIP
+        shell: pwsh
+        run: |
+          cpack --config build/release-windows/CPackConfig.cmake -G ZIP -B dist
+          ./packaging/windows/verify-package.ps1 -Archive dist/GlassLight-0.2.0-windows-x64.zip
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: GlassLight-0.2.0-windows-x64
+          path: dist/GlassLight-0.2.0-windows-x64.zip
+          if-no-files-found: error
