@@ -120,7 +120,9 @@ struct RendererDiagnostics {
     bool timestampAvailable = false;
     float timestampPeriodNanoseconds = 0.0f;
     MemoryAllocationDiagnostics accumulation{};
+    MemoryAllocationDiagnostics resolved{};
     MemoryAllocationDiagnostics settings{};
+    MemoryAllocationDiagnostics statistics{};
     MemoryAllocationDiagnostics upload{};
     MemoryAllocationDiagnostics readback{};
     std::uint64_t transientAllocationBytes = 0;

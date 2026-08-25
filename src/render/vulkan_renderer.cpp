@@ -22,6 +22,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <utility>
 
 #ifndef GLASSLIGHT_SHADER_DIR
@@ -117,7 +118,7 @@ struct PreviewPush {
     float padding2;
 };
 
-struct GpuSettingsCommon {
+struct alignas(16) GpuSettingsCommon {
     // vec4-aligned layout shared with the shader's std430 storage block.
     std::array<std::array<float, 4>, 5> palette{};
     std::array<std::uint32_t, 4> shapeRegion{};
@@ -128,14 +129,16 @@ struct GpuSettingsCommon {
     std::array<std::uint32_t, 4> renderOptions{};
 };
 
-struct LegacyGpuSettings : GpuSettingsCommon {
+struct alignas(16) LegacyGpuSettings {
+    GpuSettingsCommon common{};
     // Family-specialized constants and deterministic region descriptors. These
     // replace hashing and seed decoding in the repeated SDF/tint hot paths.
     std::array<std::array<float, 4>, 4> legacyShape{};
     std::array<std::array<float, 4>, 24> legacyCells{};
 };
 
-struct FractureGpuSettings : GpuSettingsCommon {
+struct alignas(16) FractureGpuSettings {
+    GpuSettingsCommon common{};
     std::array<std::uint32_t, 4> fractureInfo{};
     std::array<float, 4> fractureBounds{};
     std::array<std::array<float, 4>, 4> fractureGroupBounds{};
@@ -155,9 +158,31 @@ static_assert(sizeof(TracePush) == 32);
 static_assert(sizeof(ResolvePush) == 48);
 static_assert(sizeof(PreviewPush) == 32);
 static_assert(sizeof(GpuSettingsCommon) == 176);
+static_assert(alignof(GpuSettingsCommon) == 16);
+static_assert(std::is_standard_layout_v<GpuSettingsCommon>);
+static_assert(offsetof(GpuSettingsCommon, palette) == 0);
+static_assert(offsetof(GpuSettingsCommon, shapeRegion) == 80);
+static_assert(offsetof(GpuSettingsCommon, geometry) == 96);
+static_assert(offsetof(GpuSettingsCommon, optical) == 112);
+static_assert(offsetof(GpuSettingsCommon, light) == 128);
+static_assert(offsetof(GpuSettingsCommon, rotation) == 144);
+static_assert(offsetof(GpuSettingsCommon, renderOptions) == 160);
 static_assert(sizeof(LegacyGpuSettings) == 624);
+static_assert(alignof(LegacyGpuSettings) == 16);
+static_assert(std::is_standard_layout_v<LegacyGpuSettings>);
+static_assert(offsetof(LegacyGpuSettings, common) == 0);
+static_assert(offsetof(LegacyGpuSettings, legacyShape) == 176);
+static_assert(offsetof(LegacyGpuSettings, legacyCells) == 240);
 static_assert(sizeof(FractureGpuSettings::Shard) == 80);
 static_assert(sizeof(FractureGpuSettings) == 4880);
+static_assert(alignof(FractureGpuSettings) == 16);
+static_assert(std::is_standard_layout_v<FractureGpuSettings>);
+static_assert(offsetof(FractureGpuSettings, common) == 0);
+static_assert(offsetof(FractureGpuSettings, fractureInfo) == 176);
+static_assert(offsetof(FractureGpuSettings, fractureBounds) == 192);
+static_assert(offsetof(FractureGpuSettings, fractureGroupBounds) == 208);
+static_assert(offsetof(FractureGpuSettings, fractureShards) == 272);
+static_assert(offsetof(FractureGpuSettings, fracturePlanes) == 1552);
 
 struct PreparedGpuSettings {
     alignas(16) std::array<std::byte, sizeof(FractureGpuSettings)> bytes{};
@@ -236,7 +261,7 @@ PreparedGpuSettings makeGpuSettings(const CompositionSettings& settings,
     PreparedGpuSettings prepared;
     if (family == ShapeFamily::Fracture) {
         FractureGpuSettings gpu{};
-        populateCommonGpuSettings(gpu, settings, family, seed, interfaceDepth);
+        populateCommonGpuSettings(gpu.common, settings, family, seed, interfaceDepth);
         const FractureLayout layout = buildFractureLayout(settings);
         gpu.fractureInfo = {
             layout.shardCount,
@@ -326,7 +351,7 @@ PreparedGpuSettings makeGpuSettings(const CompositionSettings& settings,
     }
 
     LegacyGpuSettings gpu{};
-    populateCommonGpuSettings(gpu, settings, family, seed, interfaceDepth);
+    populateCommonGpuSettings(gpu.common, settings, family, seed, interfaceDepth);
     switch (family) {
     case ShapeFamily::Lens: {
         const float ellipticity = 0.88f + 0.15f * settingsRandom01(seed ^ 0x718u);
@@ -398,6 +423,7 @@ struct VulkanRenderer::Impl {
         Buffer statistics;
         Buffer upload;
         Buffer readback;
+        VkDeviceSize settingsPayloadSize = sizeof(LegacyGpuSettings);
         SlotState state = SlotState::Free;
         bool releaseRequested = false;
         std::uint64_t generation = 0;
@@ -878,7 +904,7 @@ struct VulkanRenderer::Impl {
             {slot.accumulation.buffer, 0, slot.accumulation.size},
             {slot.resolved.buffer, 0, slot.resolved.size},
             {slot.statistics.buffer, 0, slot.statistics.size},
-            {slot.settings.buffer, 0, slot.settings.size}
+            {slot.settings.buffer, 0, slot.settingsPayloadSize}
         }};
         std::array<VkWriteDescriptorSet, 4> writes{};
         for (std::uint32_t index = 0; index < writes.size(); ++index) {
@@ -941,7 +967,9 @@ struct VulkanRenderer::Impl {
             return result;
         };
         diagnosticSnapshot.accumulation = describe(slot.accumulation);
+        diagnosticSnapshot.resolved = describe(slot.resolved);
         diagnosticSnapshot.settings = describe(slot.settings);
+        diagnosticSnapshot.statistics = describe(slot.statistics);
         diagnosticSnapshot.upload = describe(slot.upload);
         diagnosticSnapshot.readback = describe(slot.readback);
         diagnosticSnapshot.transientAllocationBytes = 0u;
@@ -964,7 +992,13 @@ struct VulkanRenderer::Impl {
                 std::chrono::duration<double, std::milli>(now - lastCompletion).count();
         }
         lastCompletion = now;
-        vmaInvalidateAllocation(allocator, slot.readback.allocation, 0, VK_WHOLE_SIZE);
+        const VkResult invalidateStatus = vmaInvalidateAllocation(
+            allocator, slot.readback.allocation, 0, VK_WHOLE_SIZE);
+        if (invalidateStatus != VK_SUCCESS) {
+            slot.failure = vkError("vmaInvalidateAllocation", invalidateStatus);
+            slot.state = SlotState::Failed;
+            return;
+        }
         const std::uint32_t width = slot.glassPreview
             ? slot.previewRequest.width : slot.request.width;
         const std::uint32_t height = slot.glassPreview
@@ -975,9 +1009,7 @@ struct VulkanRenderer::Impl {
         const std::uint32_t dispatchCount = slot.stats.dispatchCount;
         slot.stats = {};
         slot.stats.dispatchCount = dispatchCount;
-        slot.stats.requestedSamples = slot.glassPreview ? 0u :
-            (slot.request.resolveSamples == 0u
-                ? slot.request.samples : slot.request.resolveSamples);
+        slot.stats.requestedSamples = slot.glassPreview ? 0u : slot.request.samples;
         slot.stats.tracedSamples = slot.stats.requestedSamples;
         slot.stats.depositedSamples = slot.glassPreview ? gpuStats[6] : gpuStats[0];
         slot.stats.estimatedHitRate = slot.glassPreview ? 0.0 :
@@ -1295,8 +1327,14 @@ RenderTicket VulkanRenderer::submit(const RenderRequest& request, std::string& e
         request.settings, family, seed, request.interactiveInterfaceDepth);
     impl_->diagnosticSnapshot.settingsPayloadBytes =
         static_cast<std::uint32_t>(gpuSettings.size);
+    slot.settingsPayloadSize = gpuSettings.size;
     std::memcpy(slot.upload.mapped, gpuSettings.bytes.data(), gpuSettings.size);
-    vmaFlushAllocation(impl_->allocator, slot.upload.allocation, 0, gpuSettings.size);
+    const VkResult flushStatus = vmaFlushAllocation(
+        impl_->allocator, slot.upload.allocation, 0, gpuSettings.size);
+    if (flushStatus != VK_SUCCESS) {
+        error = vkError("vmaFlushAllocation", flushStatus);
+        return {};
+    }
     impl_->updateDescriptors(slot);
     if (!impl_->beginCommands(slot, error)) return {};
 
@@ -1469,8 +1507,7 @@ RenderTicket VulkanRenderer::submit(const RenderRequest& request, std::string& e
     slot.failure.clear();
     slot.releaseRequested = false;
     if (!impl_->submitCommands(slot, error)) {
-        slot.state = Impl::SlotState::Failed;
-        slot.failure = error;
+        slot.state = Impl::SlotState::Free;
         return {};
     }
     error.clear();
@@ -1660,8 +1697,14 @@ RenderTicket VulkanRenderer::submitGlassPreview(const GlassPreviewRequest& reque
     const PreparedGpuSettings gpuSettings = makeGpuSettings(request.settings, family, seed);
     impl_->diagnosticSnapshot.settingsPayloadBytes =
         static_cast<std::uint32_t>(gpuSettings.size);
+    slot.settingsPayloadSize = gpuSettings.size;
     std::memcpy(slot.upload.mapped, gpuSettings.bytes.data(), gpuSettings.size);
-    vmaFlushAllocation(impl_->allocator, slot.upload.allocation, 0, gpuSettings.size);
+    const VkResult flushStatus = vmaFlushAllocation(
+        impl_->allocator, slot.upload.allocation, 0, gpuSettings.size);
+    if (flushStatus != VK_SUCCESS) {
+        error = vkError("vmaFlushAllocation", flushStatus);
+        return {};
+    }
     impl_->updateDescriptors(slot);
     if (!impl_->beginCommands(slot, error)) return {};
 
@@ -1762,8 +1805,7 @@ RenderTicket VulkanRenderer::submitGlassPreview(const GlassPreviewRequest& reque
     slot.failure.clear();
     slot.releaseRequested = false;
     if (!impl_->submitCommands(slot, error)) {
-        slot.state = Impl::SlotState::Failed;
-        slot.failure = error;
+        slot.state = Impl::SlotState::Free;
         return {};
     }
     error.clear();

@@ -152,8 +152,9 @@ bool splat(vec2 wall, uint channel, float energy, uint sequence) {
 
 void tracePhoton(uint localSample) {
     uint sampleIndex = pc.sampleBaseLow + localSample;
+    uint sampleHigh = pc.sampleBaseHigh + uint(sampleIndex < pc.sampleBaseLow);
     uint sequence = glassHash32(sampleIndex ^ settings.shapeRegion.w ^
-                                glassHash32(pc.sampleBaseHigh));
+                                glassHash32(sampleHigh));
     vec2 targetDisk = concentricDisk(glassRandom01(sequence),
                                      glassRandom01(sequence ^ 0x9e3779b9u));
     vec2 emitterDisk = concentricDisk(glassRandom01(sequence ^ 0x68bc21ebu),

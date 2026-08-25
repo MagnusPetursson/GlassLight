@@ -57,13 +57,22 @@ float linearToSrgb(float x) {
     return x <= 0.0031308 ? 12.92 * x : 1.055 * pow(x, 1.0 / 2.4) - 0.055;
 }
 
-shared vec3 gaussianTile[18][18];
+const uint TILE_SIZE = GLASSLIGHT_IMAGE_GROUP_SIZE + 2u;
+const uint TILE_PIXELS = TILE_SIZE * TILE_SIZE;
+const uint GROUP_INVOCATIONS =
+    GLASSLIGHT_IMAGE_GROUP_SIZE * GLASSLIGHT_IMAGE_GROUP_SIZE;
+shared vec3 gaussianTile[GLASSLIGHT_IMAGE_GROUP_SIZE + 2]
+                        [GLASSLIGHT_IMAGE_GROUP_SIZE + 2];
 
 void main() {
-    uint localIndex = gl_LocalInvocationID.y * 16u + gl_LocalInvocationID.x;
-    ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy) * 16 - ivec2(1);
-    for (uint tileIndex = localIndex; tileIndex < 324u; tileIndex += 256u) {
-        ivec2 tilePosition = ivec2(int(tileIndex % 18u), int(tileIndex / 18u));
+    uint localIndex = gl_LocalInvocationID.y * GLASSLIGHT_IMAGE_GROUP_SIZE +
+                      gl_LocalInvocationID.x;
+    ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy) *
+                       int(GLASSLIGHT_IMAGE_GROUP_SIZE) - ivec2(1);
+    for (uint tileIndex = localIndex; tileIndex < TILE_PIXELS;
+         tileIndex += GROUP_INVOCATIONS) {
+        ivec2 tilePosition = ivec2(int(tileIndex % TILE_SIZE),
+                                   int(tileIndex / TILE_SIZE));
         gaussianTile[tilePosition.y][tilePosition.x] =
             accumulatedAt(tileOrigin + tilePosition);
     }

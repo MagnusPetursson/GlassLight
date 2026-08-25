@@ -664,52 +664,128 @@ int validateFamilies(glasslight::VulkanRenderer& renderer,
             }
         }
     }
+    glasslight::RenderRequest rollover = progressive;
+    rollover.width = 64u;
+    rollover.height = 36u;
+    rollover.samples = 256u;
+    rollover.resolveSamples = 256u;
+    rollover.sampleOffset = 0xffff'ff00ULL;
+    rollover.progressivePass = 0u;
+    rollover.preserveAccumulation = false;
+    const auto rolloverFirst = renderer.submit(rollover, asyncError);
+    auto rolloverPoll = rolloverFirst ? waitFor(rolloverFirst) :
+        glasslight::RenderPollResult{};
+    if (!rolloverFirst || rolloverPoll.state != glasslight::RenderPollState::Ready) {
+        fail("64-bit sample rollover first pass failed: " + asyncError);
+    } else {
+        renderer.release(rolloverFirst);
+        rollover.sampleOffset += rollover.samples;
+        rollover.resolveSamples = 512u;
+        rollover.progressivePass = 1u;
+        rollover.preserveAccumulation = true;
+        const auto rolloverSecond = renderer.submit(rollover, asyncError);
+        rolloverPoll = rolloverSecond ? waitFor(rolloverSecond) :
+            glasslight::RenderPollResult{};
+        if (!rolloverSecond || rolloverPoll.state != glasslight::RenderPollState::Ready) {
+            fail("64-bit sample rollover second pass failed: " + asyncError);
+        } else {
+            std::vector<std::uint32_t> rolloverPixels(
+                rolloverPoll.frame.rgba8,
+                rolloverPoll.frame.rgba8 + static_cast<std::size_t>(
+                    rolloverPoll.frame.width) * rolloverPoll.frame.height);
+            renderer.release(rolloverSecond);
+            rollover.samples = 512u;
+            rollover.sampleOffset = 0xffff'ff00ULL;
+            rollover.resolveSamples = 0u;
+            rollover.progressivePass = 0u;
+            rollover.preserveAccumulation = false;
+            glasslight::RenderedImage rolloverExact;
+            glasslight::RenderStats rolloverStats;
+            if (!renderer.render(rollover, rolloverExact, rolloverStats, asyncError) ||
+                rolloverExact.rgba8 != rolloverPixels) {
+                fail("64-bit sample rollover differs between progressive and exact renders");
+            }
+        }
+    }
     const auto diagnostics = renderer.diagnostics();
-    if (!diagnostics.accumulation.deviceLocal ||
-        !diagnostics.settings.deviceLocal || !diagnostics.upload.hostVisible ||
-        !diagnostics.readback.hostVisible) {
-        fail("VMA did not select device-local working and host-visible staging memory");
+    if (!diagnostics.accumulation.deviceLocal || !diagnostics.resolved.deviceLocal ||
+        !diagnostics.settings.deviceLocal || !diagnostics.statistics.deviceLocal ||
+        !diagnostics.upload.hostVisible || !diagnostics.readback.hostVisible ||
+        !diagnostics.readback.hostCached) {
+        fail("VMA did not select device-local working, host-visible staging, and "
+             "host-cached readback memory");
     }
     if (diagnostics.settingsPayloadBytes != 624u) {
         fail("legacy renders did not use the compact precomputed settings layout");
     }
     for (const glasslight::ShapeFamily candidateFamily : {
              glasslight::ShapeFamily::Pebble, glasslight::ShapeFamily::Fracture}) {
-        glasslight::RenderRequest selectedGroups = asyncRequest;
-        selectedGroups.settings.shapeFamily = candidateFamily;
-        selectedGroups.settings.fractureShardCount = 3u;
-        selectedGroups.width = 128u;
-        selectedGroups.height = 72u;
-        selectedGroups.samples = 16'384u;
-        glasslight::RenderedImage alternateImage;
+        glasslight::RenderRequest candidate = asyncRequest;
+        candidate.settings.shapeFamily = candidateFamily;
+        candidate.settings.fractureShardCount = 3u;
+        candidate.width = 128u;
+        candidate.height = 72u;
+        candidate.samples = 16'384u;
+        glasslight::RenderedImage baselineImage;
         glasslight::RenderStats candidateStats;
-        selectedGroups.traceGroupSize = 128u;
-        selectedGroups.imageGroupSize = 8u;
-        if (!renderer.render(selectedGroups, alternateImage, candidateStats, asyncError)) {
-            fail("alternate workgroup wall render failed: " + asyncError);
+        if (!renderer.render(candidate, baselineImage, candidateStats, asyncError)) {
+            fail("baseline workgroup wall render failed: " + asyncError);
             continue;
         }
-        std::string candidateReason;
-        if (!structurallyUseful(alternateImage, candidateStats,
-                                analyze(alternateImage), candidateReason)) {
-            fail("alternate workgroup wall output was structurally empty for " +
-                 familySlug(candidateFamily) + ": " + candidateReason);
+        const glasslight::RenderStats baselineStats = candidateStats;
+        const std::uint32_t expectedPayload =
+            candidateFamily == glasslight::ShapeFamily::Fracture ? 4'880u : 624u;
+        if (renderer.diagnostics().settingsPayloadBytes != expectedPayload) {
+            fail("settings descriptor payload did not match the active family layout for " +
+                 familySlug(candidateFamily));
+        }
+        for (const auto [traceGroup, imageGroup] :
+             {std::pair{128u, 16u}, std::pair{256u, 8u}, std::pair{128u, 8u}}) {
+            candidate.traceGroupSize = traceGroup;
+            candidate.imageGroupSize = imageGroup;
+            glasslight::RenderedImage alternateImage;
+            if (!renderer.render(candidate, alternateImage, candidateStats, asyncError)) {
+                fail("alternate workgroup wall render failed: " + asyncError);
+                continue;
+            }
+            if (alternateImage.rgba8 != baselineImage.rgba8) {
+                fail("alternate workgroup wall render was not exactly deterministic for " +
+                     familySlug(candidateFamily) + " at " +
+                     std::to_string(traceGroup) + "/" +
+                     std::to_string(imageGroup));
+            }
+            if (candidateStats.depositedSamples != baselineStats.depositedSamples ||
+                candidateStats.interfaceEvents != baselineStats.interfaceEvents ||
+                candidateStats.internalReflections != baselineStats.internalReflections ||
+                candidateStats.traversalExhausted != baselineStats.traversalExhausted) {
+                fail("alternate trace workgroup statistics were not deterministic for " +
+                     familySlug(candidateFamily) + " at " +
+                     std::to_string(traceGroup));
+            }
         }
         glasslight::GlassPreviewRequest selectedPreview;
-        selectedPreview.settings = selectedGroups.settings;
+        selectedPreview.settings = candidate.settings;
         selectedPreview.width = 96u;
         selectedPreview.height = 96u;
-        glasslight::RenderedImage alternatePreviewImage;
+        glasslight::RenderedImage baselinePreviewImage;
         glasslight::GlassPreviewStats candidatePreviewStats;
+        if (!renderer.renderGlassPreview(selectedPreview, baselinePreviewImage,
+                                         candidatePreviewStats, asyncError)) {
+            fail("baseline preview workgroup render failed: " + asyncError);
+            continue;
+        }
+        const std::uint64_t baselinePreviewHits = candidatePreviewStats.shadedPixels;
+        glasslight::RenderedImage alternatePreviewImage;
         selectedPreview.imageGroupSize = 8u;
         if (!renderer.renderGlassPreview(selectedPreview, alternatePreviewImage,
                                          candidatePreviewStats, asyncError)) {
             fail("alternate preview workgroup render failed: " + asyncError);
-        } else if (!previewStructurallyUseful(
-                       alternatePreviewImage, candidatePreviewStats,
-                       analyze(alternatePreviewImage), candidateReason)) {
-            fail("alternate preview workgroup output was structurally empty for " +
-                 familySlug(candidateFamily) + ": " + candidateReason);
+        } else if (alternatePreviewImage.rgba8 != baselinePreviewImage.rgba8) {
+            fail("alternate preview workgroup render was not exactly deterministic for " +
+                 familySlug(candidateFamily));
+        } else if (candidatePreviewStats.shadedPixels != baselinePreviewHits) {
+            fail("alternate preview workgroup statistics were not deterministic for " +
+                 familySlug(candidateFamily));
         }
     }
     glasslight::RenderRequest allocationProbe = asyncRequest;
