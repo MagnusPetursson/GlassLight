@@ -38,7 +38,7 @@ the interface.
 
 ![A monochrome Cut Crystal composition completing a seamless rotation](docs/images/glasslight-loop.gif)
 
-This preview slows the exported rotation for easier viewing.
+
 
 ![Three artworks exported from GlassLight: Cathedral Faceted, Ember Cut Crystal, and Tidal Ribbon](docs/images/glasslight-gallery.jpg)
 
