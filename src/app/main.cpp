@@ -534,7 +534,9 @@ int runBenchmark(const std::filesystem::path& outputDirectory) {
         {"settingsPayloadBytes", diagnostics.settingsPayloadBytes}};
     system["allocations"] = {
         {"accumulation", allocationJson(diagnostics.accumulation)},
+        {"resolved", allocationJson(diagnostics.resolved)},
         {"settings", allocationJson(diagnostics.settings)},
+        {"statistics", allocationJson(diagnostics.statistics)},
         {"upload", allocationJson(diagnostics.upload)},
         {"readback", allocationJson(diagnostics.readback)}};
     system["workgroups"] = {
@@ -566,6 +568,19 @@ int runBenchmark(const std::filesystem::path& outputDirectory) {
         endToEndTimes.push_back(value.timings.submitToReadyMilliseconds +
                                 value.timings.sdlUploadMilliseconds);
     };
+    const auto uploadBenchmarkFrame = [&](const glasslight::RenderTicket ticket,
+                                          glasslight::RenderPollResult& result) {
+        const auto uploadStart = std::chrono::steady_clock::now();
+        if (!uploadTexture(presentation.renderer, presentation.texture,
+                           result.frame, error)) {
+            return false;
+        }
+        result.timings.sdlUploadMilliseconds =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - uploadStart).count();
+        renderer.recordSdlUpload(ticket, result.timings.sdlUploadMilliseconds);
+        return true;
+    };
     for (int index = 0; index < 5; ++index) {
         warm.settings.phase = static_cast<float>(index) / 5.0f;
         const auto ticket = renderer.submit(warm, error);
@@ -573,6 +588,11 @@ int runBenchmark(const std::filesystem::path& outputDirectory) {
         if (!ticket || !waitForTicket(renderer, ticket, result, error)) {
             if (ticket) renderer.release(ticket);
             std::cerr << "Fixed benchmark failed: " << error << '\n';
+            return 2;
+        }
+        if (!uploadBenchmarkFrame(ticket, result)) {
+            renderer.release(ticket);
+            std::cerr << "Fixed benchmark SDL upload failed: " << error << '\n';
             return 2;
         }
         record(result);
@@ -590,15 +610,20 @@ int runBenchmark(const std::filesystem::path& outputDirectory) {
                                             const std::uint32_t imageGroup) {
         traceTimes.clear(); resolveTimes.clear(); transferTimes.clear();
         endToEndTimes.clear(); sdlUploadTimes.clear();
-        for (int index = 0; index < 3; ++index) {
+        int samplesRemaining = 7;
+        while (samplesRemaining-- > 0) {
             glasslight::RenderRequest candidate = warm;
             candidate.traceGroupSize = traceGroup;
             candidate.imageGroupSize = imageGroup;
-            candidate.settings.phase = static_cast<float>(index) / 3.0f;
+            candidate.settings.phase = 0.37f;
             const auto ticket = renderer.submit(candidate, error);
             glasslight::RenderPollResult result;
             if (!ticket || !waitForTicket(renderer, ticket, result, error)) {
                 if (ticket) renderer.release(ticket);
+                return false;
+            }
+            if (!uploadBenchmarkFrame(ticket, result)) {
+                renderer.release(ticket);
                 return false;
             }
             record(result);
@@ -606,7 +631,8 @@ int runBenchmark(const std::filesystem::path& outputDirectory) {
         }
         report << name << "\tworkgroup-candidate\t1280\t720\t" << warm.samples << '\t'
                << percentile(traceTimes, 0.5) << '\t' << percentile(resolveTimes, 0.5)
-               << '\t' << percentile(transferTimes, 0.5) << "\t0\t"
+               << '\t' << percentile(transferTimes, 0.5) << '\t'
+               << percentile(sdlUploadTimes, 0.5) << '\t'
                << percentile(endToEndTimes, 0.5) << '\t'
                << percentile(endToEndTimes, 0.95) << "\t0\t0\t"
                << warm.samples << '\t' << warm.samples << "\tmeasured\n";
@@ -623,12 +649,13 @@ int runBenchmark(const std::filesystem::path& outputDirectory) {
                                                const std::uint32_t imageGroup) {
         traceTimes.clear(); resolveTimes.clear(); transferTimes.clear();
         endToEndTimes.clear(); sdlUploadTimes.clear();
-        for (int index = 0; index < 3; ++index) {
+        int samplesRemaining = 7;
+        while (samplesRemaining-- > 0) {
             glasslight::GlassPreviewRequest candidate;
             candidate.settings = settings;
             candidate.width = 320u;
             candidate.height = 180u;
-            candidate.orbitYaw += static_cast<float>(index) * 0.1f;
+            candidate.orbitYaw = 0.73f;
             candidate.imageGroupSize = imageGroup;
             const auto ticket = renderer.submitGlassPreview(candidate, error);
             glasslight::RenderPollResult result;
@@ -636,12 +663,17 @@ int runBenchmark(const std::filesystem::path& outputDirectory) {
                 if (ticket) renderer.release(ticket);
                 return false;
             }
+            if (!uploadBenchmarkFrame(ticket, result)) {
+                renderer.release(ticket);
+                return false;
+            }
             record(result);
             renderer.release(ticket);
         }
         report << name << "\tworkgroup-candidate\t320\t180\t0\t"
                << percentile(traceTimes, 0.5) << '\t' << percentile(resolveTimes, 0.5)
-               << '\t' << percentile(transferTimes, 0.5) << "\t0\t"
+               << '\t' << percentile(transferTimes, 0.5) << '\t'
+               << percentile(sdlUploadTimes, 0.5) << '\t'
                << percentile(endToEndTimes, 0.5) << '\t'
                << percentile(endToEndTimes, 0.95)
                << "\t0\t0\t0\t0\tmeasured\n";
@@ -676,16 +708,11 @@ int runBenchmark(const std::filesystem::path& outputDirectory) {
             std::cerr << "Adaptive benchmark failed: " << error << '\n';
             return 2;
         }
-        const auto uploadStart = std::chrono::steady_clock::now();
-        if (!uploadTexture(presentation.renderer, presentation.texture,
-                           result.frame, error)) {
+        if (!uploadBenchmarkFrame(ticket, result)) {
             renderer.release(ticket);
             std::cerr << "Adaptive SDL upload failed: " << error << '\n';
             return 2;
         }
-        result.timings.sdlUploadMilliseconds = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - uploadStart).count();
-        renderer.recordSdlUpload(ticket, result.timings.sdlUploadMilliseconds);
         const auto completed = std::chrono::steady_clock::now();
         result.timings.completedFrameIntervalMilliseconds =
             std::chrono::duration<double, std::milli>(completed - previousCompletion).count();
@@ -724,42 +751,54 @@ int runBenchmark(const std::filesystem::path& outputDirectory) {
         ExactWorkload{"video-frame", 1920u, 1080u, glasslight::QualityPreset::Standard, false},
         ExactWorkload{"still-4k", 3840u, 2160u, glasslight::QualityPreset::Standard, false}};
     for (const auto& exact : exactWorkloads) {
-        glasslight::RenderPollResult result;
+        traceTimes.clear(); resolveTimes.clear(); transferTimes.clear();
+        sdlUploadTimes.clear(); endToEndTimes.clear();
         std::uint32_t photons = 0;
-        glasslight::RenderTicket ticket;
-        if (exact.preview) {
-            glasslight::GlassPreviewRequest request;
-            request.settings = settings;
-            request.width = exact.width;
-            request.height = exact.height;
-            ticket = renderer.submitGlassPreview(request, error);
-        } else {
-            glasslight::RenderRequest request;
-            request.settings = settings;
-            request.settings.quality = exact.quality;
-            request.width = exact.width;
-            request.height = exact.height;
-            photons = static_cast<std::uint32_t>(std::llround(
-                glasslight::photonsPerMegapixel(exact.quality) *
-                static_cast<double>(exact.width) * exact.height / 1'000'000.0));
-            request.samples = photons;
-            request.exportRender = true;
-            ticket = renderer.submit(request, error);
-        }
-        if (!ticket || !waitForTicket(renderer, ticket, result, error)) {
-            if (ticket) renderer.release(ticket);
-            std::cerr << exact.name << " benchmark failed: " << error << '\n';
-            return 2;
+        for (int sample = 0; sample < 5; ++sample) {
+            glasslight::RenderPollResult result;
+            glasslight::RenderTicket ticket;
+            if (exact.preview) {
+                glasslight::GlassPreviewRequest request;
+                request.settings = settings;
+                request.settings.phase = static_cast<float>(sample) / 5.0f;
+                request.width = exact.width;
+                request.height = exact.height;
+                ticket = renderer.submitGlassPreview(request, error);
+            } else {
+                glasslight::RenderRequest request;
+                request.settings = settings;
+                request.settings.quality = exact.quality;
+                request.settings.phase = static_cast<float>(sample) / 5.0f;
+                request.width = exact.width;
+                request.height = exact.height;
+                photons = static_cast<std::uint32_t>(std::llround(
+                    glasslight::photonsPerMegapixel(exact.quality) *
+                    static_cast<double>(exact.width) * exact.height / 1'000'000.0));
+                request.samples = photons;
+                request.exportRender = true;
+                ticket = renderer.submit(request, error);
+            }
+            if (!ticket || !waitForTicket(renderer, ticket, result, error)) {
+                if (ticket) renderer.release(ticket);
+                std::cerr << exact.name << " benchmark failed: " << error << '\n';
+                return 2;
+            }
+            if (exact.preview && !uploadBenchmarkFrame(ticket, result)) {
+                renderer.release(ticket);
+                std::cerr << exact.name << " SDL upload failed: " << error << '\n';
+                return 2;
+            }
+            record(result);
+            renderer.release(ticket);
         }
         report << exact.name << "\tfixed\t" << exact.width << '\t' << exact.height << '\t'
-               << photons << '\t' << result.timings.traceMilliseconds << '\t'
-               << result.timings.resolveMilliseconds << '\t'
-               << result.timings.transferMilliseconds << '\t'
-               << result.timings.sdlUploadMilliseconds << '\t'
-               << result.timings.submitToReadyMilliseconds << '\t'
-               << result.timings.submitToReadyMilliseconds << "\t0\t0\t" << photons << '\t'
+               << photons << '\t' << percentile(traceTimes, 0.5) << '\t'
+               << percentile(resolveTimes, 0.5) << '\t'
+               << percentile(transferTimes, 0.5) << '\t'
+               << percentile(sdlUploadTimes, 0.5) << '\t'
+               << percentile(endToEndTimes, 0.5) << '\t'
+               << percentile(endToEndTimes, 0.95) << "\t0\t0\t" << photons << '\t'
                << photons << "\tmeasured\n";
-        renderer.release(ticket);
     }
 
     renderer.trimTransientResources();
@@ -1367,7 +1406,7 @@ int main(int argc, char** argv) {
         std::string error;
         if (!renderer.initialize(preferredGpuName(), error)) {
             std::cerr << error << '\n';
-            return 1;
+            return 2;
         }
         std::cout << renderer.gpuName() << '\n';
         return 0;
@@ -1377,12 +1416,12 @@ int main(int argc, char** argv) {
         const auto names = glasslight::VulkanRenderer::compatibleGpuNames(error);
         if (names.empty() && !error.empty()) {
             std::cerr << error << '\n';
-            return 1;
+            return 2;
         }
         for (const std::string& name : names) {
             std::cout << name << '\n';
         }
-        return names.empty() ? 1 : 0;
+        return names.empty() ? 2 : 0;
     }
     if (argc >= 2 && (std::string(argv[1]) == "--help" ||
                       std::string(argv[1]) == "-h")) {
@@ -1423,6 +1462,10 @@ int main(int argc, char** argv) {
         }
         return renderStillFromCli(
             glasslight::platform::pathFromUtf8(argv[2]), seed, family);
+    }
+    if (argc >= 2) {
+        std::cerr << "Unknown command: " << argv[1] << "\nUse --help for usage.\n";
+        return 2;
     }
     return runStudio();
 }

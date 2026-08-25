@@ -36,6 +36,7 @@ void AdaptiveRenderController::reset(const QualityPreset ceiling,
     paused_ = false;
     notice_ = false;
     underBudgetFrames_ = 0;
+    previewUnderBudgetFrames_ = 0;
     lastInteractionMilliseconds_ = nowMilliseconds;
     traceMillisecondsPerPhoton_ = 0.0;
     fixedMilliseconds_ = 0.0;
@@ -50,6 +51,7 @@ void AdaptiveRenderController::noteInteraction(const double nowMilliseconds) {
     interfaceDepth_ = QualityPreset::Draft;
     previewScale_ = 0.5f;
     underBudgetFrames_ = 0;
+    previewUnderBudgetFrames_ = 0;
 }
 
 void AdaptiveRenderController::setPaused(const bool paused,
@@ -121,9 +123,16 @@ void AdaptiveRenderController::update(const RenderTimings& timings,
         const double total = timings.submitToReadyMilliseconds +
                              timings.sdlUploadMilliseconds;
         if (total > kFrameBudgetMilliseconds * 1.08) {
-            previewScale_ = 0.5f;
+            previewUnderBudgetFrames_ = 0;
+            previewScale_ = previewScale_ > 0.75f ? 0.75f : 0.5f;
         } else if (total < kFrameBudgetMilliseconds * 0.72 && photons_ > floor) {
-            previewScale_ = previewScale_ < 0.75f ? 0.75f : 1.0f;
+            ++previewUnderBudgetFrames_;
+            if (previewUnderBudgetFrames_ >= 8u) {
+                previewScale_ = previewScale_ < 0.75f ? 0.75f : 1.0f;
+                previewUnderBudgetFrames_ = 0;
+            }
+        } else {
+            previewUnderBudgetFrames_ = 0;
         }
     }
     updateNotice(nowMilliseconds);

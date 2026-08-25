@@ -32,7 +32,7 @@ int main() {
     expect(work.interfaceDepth == glasslight::QualityPreset::Draft,
            "depth falls only to Draft");
 
-    controller.reset(glasslight::QualityPreset::Standard, 1280, 720, 60.0);
+    controller.reset(glasslight::QualityPreset::Standard, 1280, 720, 0.0);
     glasslight::RenderTimings fast;
     fast.traceMilliseconds = 8.0;
     fast.resolveMilliseconds = 2.0;
@@ -40,21 +40,33 @@ int main() {
     fast.sdlUploadMilliseconds = 1.0;
     fast.submitToReadyMilliseconds = 12.0;
     fast.completedFrameIntervalMilliseconds = 32.0;
-    for (int index = 0; index < 8; ++index) controller.update(fast, 100.0 + index * 32.0);
-    work = controller.workload(356.0);
+    for (int index = 0; index < 8; ++index) controller.update(fast, 10.0 + index * 16.0);
+    work = controller.workload(122.0);
     expect(work.photons > 460'800u && work.photons <= 507'136u,
            "quality rises by at most ten percent after eight good frames");
     expect((work.photons & 255u) == 0u, "workload stays quantized to 256 invocations");
+    expect(work.glassPreviewScale == 0.5f,
+           "preview resolution does not rise before sustained headroom");
+    for (int index = 0; index < 7; ++index) {
+        controller.update(fast, 138.0 + index * 16.0);
+    }
+    work = controller.workload(234.0);
+    expect(work.glassPreviewScale == 0.75f,
+           "preview resolution rises one tier after sustained headroom");
+    controller.update(slow, 235.0);
+    work = controller.workload(235.0);
+    expect(work.glassPreviewScale == 0.5f,
+           "preview resolution drops immediately when the frame budget is exceeded");
 
-    controller.noteInteraction(400.0);
-    expect(!controller.workload(649.0).refining, "idle hysteresis waits 250 ms");
-    expect(controller.workload(650.0).refining &&
-           controller.workload(650.0).glassPreviewScale == 1.0f,
+    controller.noteInteraction(600.0);
+    expect(!controller.workload(849.0).refining, "idle hysteresis waits 250 ms");
+    expect(controller.workload(850.0).refining &&
+           controller.workload(850.0).glassPreviewScale == 1.0f,
            "idle hysteresis restores full preview at 250 ms");
-    controller.setPaused(true, 651.0);
-    expect(controller.workload(651.0).refining, "pause enters refinement immediately");
-    expect(controller.workload(651.0).interfaceDepth == glasslight::QualityPreset::Standard &&
-           controller.workload(651.0).glassPreviewScale == 1.0f,
+    controller.setPaused(true, 851.0);
+    expect(controller.workload(851.0).refining, "pause enters refinement immediately");
+    expect(controller.workload(851.0).interfaceDepth == glasslight::QualityPreset::Standard &&
+           controller.workload(851.0).glassPreviewScale == 1.0f,
            "pause restores selected interface depth and full preview immediately");
 
     controller.reset(glasslight::QualityPreset::Draft, 1280, 720, 0.0);

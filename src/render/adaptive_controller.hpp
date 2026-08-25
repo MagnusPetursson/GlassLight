@@ -56,6 +56,7 @@ private:
     bool paused_ = false;
     bool notice_ = false;
     std::uint32_t underBudgetFrames_ = 0;
+    std::uint32_t previewUnderBudgetFrames_ = 0;
     double lastInteractionMilliseconds_ = 0.0;
     double traceMillisecondsPerPhoton_ = 0.0;
     double fixedMilliseconds_ = 0.0;
