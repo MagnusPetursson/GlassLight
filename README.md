@@ -56,7 +56,7 @@ Download the package for your platform from the
 
 Download `GlassLight-*-windows-x64.zip`, extract the whole folder, and run
 `GlassLight.exe`. Keep the `shaders` folder beside the executable. Releases are
-currently unsigned, so Windows may show a SmartScreen warning the first time
+unsigned, so Windows may show a SmartScreen warning the first time
 you open the app.
 
 For MP4 export, place `ffmpeg.exe` beside `GlassLight.exe` or install FFmpeg on
@@ -120,9 +120,9 @@ the project layout, CLI, tests, GPU validation, benchmarks, and packaging.
 
 ## Platform and license
 
-The current release targets Windows 10/11 x64 and Linux x86_64. A CPU/OpenGL
-fallback, ARM64 packages, installers, automatic updates, and signed Windows
-binaries are not included yet.
+Releases target Windows 10/11 x64 and Linux x86_64. There is no CPU or OpenGL
+fallback, so a Vulkan 1.2 GPU is required. Packages are a Windows ZIP, an
+AppImage and a .deb, without an installer or automatic updates.
 
 GlassLight is available under the [MIT License](LICENSE). Third-party licenses
 are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
